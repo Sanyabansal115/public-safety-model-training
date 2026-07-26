@@ -16,13 +16,21 @@ warnings.filterwarnings('ignore')
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 120)
 
+<<<<<<< HEAD
 # LOAD DATA
+=======
+# 1. LOAD DATA
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 df = pd.read_csv('KSI_data.csv', encoding='utf-8-sig')
 print("1. Loading Data")
 print(f"Original dataset shape: {df.shape}")
 print(f"Total records: {df.shape[0]}, Total columns: {df.shape[1]}")
 
+<<<<<<< HEAD
 # TARGET VARIABLE PREPARATION
+=======
+# 2. TARGET VARIABLE PREPARATION
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 print("2. TARGET VARIABLE PREPARATION")
 
 print(f"\nOriginal ACCLASS distribution:\n{df['ACCLASS'].value_counts(dropna=False)}")
@@ -44,7 +52,11 @@ print(f"  Fatal    (1): {(df['ACCLASS_BINARY'] == 1).sum()}")
 print(f"  Imbalance ratio: 1:{(df['ACCLASS_BINARY'] == 0).sum() // (df['ACCLASS_BINARY'] == 1).sum()}")
 
 # 3. DATA TRANSFORMATIONS — HANDLING MISSING VALUES
+<<<<<<< HEAD
 print("\nSTEP 3: HANDLING MISSING DATA")
+=======
+print("3. HANDLING MISSING DATA")
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 
 # Show missing values before treatment
 missing = df.isnull().sum()
@@ -56,7 +68,11 @@ missing_report = pd.DataFrame({
 print("\nMissing values summary (before treatment):")
 print(missing_report[missing_report['Missing Count'] > 0])
 
+<<<<<<< HEAD
 # ── TIER 1: Binary flag columns — fill NaN with "No" ──
+=======
+# TIER 1: Binary flag columns — fill NaN with "No"
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 # Justification: These are Yes/NaN indicator flags. NaN means the condition
 # does not apply to this record (e.g., PEDESTRIAN=NaN when no pedestrian was
 # involved). These are implicit negatives, NOT unknown values.
@@ -66,17 +82,26 @@ binary_flag_cols = [
     'SPEEDING', 'AG_DRIV', 'REDLIGHT', 'ALCOHOL', 'DISABILITY'
 ]
 
+<<<<<<< HEAD
 print("\n--- TIER 1: Binary flag columns — NaN → 'No' (implicit negatives) ---")
+=======
+print("\nTIER 1: Binary flag columns — NaN → 'No' (implicit negatives)")
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 for col in binary_flag_cols:
     before = df[col].isnull().sum()
     df[col] = df[col].fillna('No')
     print(f"  {col}: filled {before} NaN values with 'No'")
 
+<<<<<<< HEAD
 # ── TIER 2: High-missingness columns (>40%) — DROP ──
+=======
+# TIER 2: High-missingness columns (>40%) — DROP ──
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 # Justification: These are conditional fields populated only for specific
 # involvement types (e.g., pedestrian details exist only when PEDESTRIAN=Yes).
 # Extreme sparsity adds noise rather than signal. The binary flag columns
 # already capture whether that involvement type was present.
+<<<<<<< HEAD
 high_missing_cols = [
     'PEDTYPE', 'PEDACT', 'PEDCOND',
     'CYCLISTYPE', 'CYCACT', 'CYCCOND',
@@ -86,6 +111,19 @@ high_missing_cols = [
     'MANOEUVER',                        
     'DRIVACT',                        
     'DRIVCOND',                           
+=======
+# INJURY and FATAL_NO are post-incident outcomes — using them to predict
+# fatality is data leakage (the model would "cheat" by seeing outcome info).
+high_missing_cols = [
+    'PEDTYPE', 'PEDACT', 'PEDCOND',
+    'CYCLISTYPE', 'CYCACT', 'CYCCOND',
+    'FATAL_NO',                             
+    'OFFSET',                               
+    'INJURY',                               
+    'MANOEUVER',                            
+    'DRIVACT',                              
+    'DRIVCOND',                             
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 ]
 
 print(f"\nTIER 2: Dropping columns with >40% missing or data leakage")
@@ -94,7 +132,11 @@ for col in high_missing_cols:
     print(f"  Dropping '{col}' — {pct:.1f}% missing")
 df = df.drop(columns=high_missing_cols)
 
+<<<<<<< HEAD
 # ── TIER 3: Low-missingness categorical columns (<5%) — mode imputation ──
+=======
+# TIER 3: Low-missingness categorical columns (<5%) — mode imputation ──
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 # Justification: Missing rates are small enough (<3%) that filling with
 # the most common value introduces negligible bias. Mode is the standard
 # imputation method for categorical features.
@@ -119,8 +161,14 @@ if len(remaining) == 0:
 else:
     print(remaining)
 
+<<<<<<< HEAD
 # 4. FEATURE SELECTION — WITH JUSTIFICATION
 print("STEP 4: FEATURE SELECTION")
+=======
+
+# 4. FEATURE SELECTION — WITH JUSTIFICATION
+print("\n4. FEATURE SELECTION")
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 
 # Columns to DROP
 drop_cols = {
@@ -184,17 +232,35 @@ for col, reason in kept_cols.items():
 
 
 # 5. DATA TRANSFORMATIONS — CATEGORICAL ENCODING & FEATURE ENGINEERING
+<<<<<<< HEAD
 print("STEP 5: CATEGORICAL DATA MANAGEMENT & FEATURE ENGINEERING")
 
 # 5a. Extract HOUR from TIME
+=======
+print("\n5. CATEGORICAL DATA MANAGEMENT & FEATURE ENGINEERING")
+
+# 5a. Extract HOUR from TIME
+# TIME is stored as integer (e.g. 1430 = 2:30 PM). Extract hour for a
+# cleaner numeric feature.
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 df['HOUR'] = df['TIME'] // 100
 df = df.drop(columns=['TIME'])
 print(f"  Extracted HOUR from TIME (range: {df['HOUR'].min()} – {df['HOUR'].max()})")
 
 # 5b. Handle INVAGE "unknown"
+<<<<<<< HEAD
 print(f"  INVAGE 'unknown' entries: {(df['INVAGE'] == 'unknown').sum()} — kept as category")
 
 # 5c. Group rare categories (<1% frequency) into "Other"
+=======
+# ~14% of INVAGE values are "unknown". Keeping as its own category because
+# the unknownness may correlate with outcome (hit-and-runs, unidentified).
+print(f" INVAGE 'unknown' entries: {(df['INVAGE'] == 'unknown').sum()} — kept as category")
+
+# 5c. Group rare categories (<1% frequency) into "Other"
+# This prevents one-hot encoding from creating many near-empty columns
+# that add dimensionality without predictive signal.
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 def group_rare(series, threshold=0.01):
     """Replace categories appearing below threshold fraction with 'Other'."""
     freq = series.value_counts(normalize=True)
@@ -218,12 +284,22 @@ for col in binary_flag_cols:
         df[col] = (df[col] == 'Yes').astype(int)
 print(f"  Encoded {len(binary_flag_cols)} binary flag columns: 'Yes'→1, 'No'→0")
 
+<<<<<<< HEAD
 # ── 5e. Dataset overview after transformations ──
 print(f"\nDataset shape after transformations: {df.shape}")
 print(f"Feature types:\n{df.dtypes.value_counts()}")
 
 # 6. TRAIN / TEST SPLIT (STRATIFIED)
 print("STEP 6: TRAIN / TEST SPLIT")
+=======
+# 5e. Dataset overview after transformations
+print(f"\nDataset shape after transformations: {df.shape}")
+print(f"Feature types:\n{df.dtypes.value_counts()}")
+
+
+# 6. TRAIN / TEST SPLIT (STRATIFIED)
+print("\n6. TRAIN / TEST SPLIT")
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 
 X = df.drop(columns=['ACCLASS_BINARY'])
 y = df['ACCLASS_BINARY']
@@ -236,6 +312,10 @@ print(f"Numeric features ({len(numeric_features)}): {numeric_features}")
 print(f"Categorical features ({len(categorical_features)}): {categorical_features}")
 
 # 80/20 split with stratification
+<<<<<<< HEAD
+=======
+# stratify=y ensures both sets preserve the original Fatal/Non-Fatal ratio
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 X_train, X_test, y_train, y_test = train_test_split(
     X, y,
     test_size=0.2,
@@ -253,15 +333,25 @@ print(f"\n  Stratification verified — both sets have ~{(y==1).mean()*100:.1f}%
 
 
 # 7. PREPROCESSING PIPELINE (ColumnTransformer)
+<<<<<<< HEAD
 print("STEP 7: PREPROCESSING PIPELINE")
 
 # Numeric pipeline
+=======
+print("\n7. PREPROCESSING PIPELINE")
+
+# Numeric pipeline: impute remaining edge cases with median, then standardize.
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 numeric_pipeline = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='median')),
     ('scaler', StandardScaler())
 ])
 
+<<<<<<< HEAD
 # Categorical pipeline
+=======
+# Categorical pipeline: impute with mode, then one-hot encode.
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 categorical_pipeline = Pipeline(steps=[
     ('imputer', SimpleImputer(strategy='most_frequent')),
     ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
@@ -292,14 +382,24 @@ print(f"  Features after encoding:  {X_train_processed.shape[1]}")
 print(f"  Training matrix shape:    {X_train_processed.shape}")
 print(f"  Test matrix shape:        {X_test_processed.shape}")
 
+<<<<<<< HEAD
 
 # 8. MANAGING IMBALANCED CLASSES (SMOTE)
 print("STEP 8: MANAGING IMBALANCED CLASSES — SMOTE")
+=======
+# 8. MANAGING IMBALANCED CLASSES (SMOTE)
+print("\n8. MANAGING IMBALANCED CLASSES — SMOTE")
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 
 print(f"\nClass distribution BEFORE SMOTE (training set):")
 print(f"  {Counter(y_train)}")
 
+<<<<<<< HEAD
 # Generating synthetic samples
+=======
+# SMOTE applied ONLY to training data — test data must remain untouched for
+# honest evaluation.
+>>>>>>> parent of 4316d43 (Revert "Merge branch 'main' of https://github.com/Sanyabansal115/public-safety-model-training")
 smote = SMOTE(random_state=42)
 X_train_resampled, y_train_resampled = smote.fit_resample(X_train_processed, y_train)
 
