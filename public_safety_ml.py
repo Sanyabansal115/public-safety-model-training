@@ -185,16 +185,9 @@ df.loc[~mask_present, "INJURY"] = df.loc[~mask_present, "INJURY"].fillna("Not Ap
 print(df.isnull().sum())
 
 
-
-
 # =============================================================================
 # DELIVERABLE 2 — DATA MODELLING
 # =============================================================================
-# Everything above is Deliverable 1 (data exploration + missing-value strategy).
-# This section builds on that cleaned frame. It deliberately does NOT reload the
-# CSV and does NOT repeat any imputation — all of that already happened above,
-# and running it twice would either double-transform values or silently undo the
-# group-by-group decisions that were justified in Deliverable 1.
 
 import numpy as np
 from collections import Counter
@@ -214,9 +207,7 @@ pd.set_option("display.width", 120)
 # 1. WORK ON A COPY OF THE EXPLORED DATA
 print("\n1. PREPARING THE MODELLING FRAME")
 
-# model_df is the only frame the modelling stage touches. df is left exactly as
-# Deliverable 1 produced it, so the exploration results stay reproducible and
-# re-running any cell above cannot be affected by modelling transformations.
+# Copying the dataframe from data exploration
 model_df = df.copy()
 print(f"Rows entering modelling: {model_df.shape[0]}, columns: {model_df.shape[1]}")
 
@@ -245,22 +236,22 @@ print(f"  Fatal     (1): {n_fatal}")
 print(f"  Imbalance ratio: 1:{n_nonfatal // n_fatal}")
 
 
-# 3. MISSING DATA — VERIFICATION ONLY (already handled in Deliverable 1)
+# 3. MISSING DATA — VERIFICATION ONLY (handled in Deliverable 1)
 print("\n3. MISSING DATA VERIFICATION")
 
 # The Group 1-6 strategy above resolved every column, so this is a guard rail
 # rather than another imputation pass. If a column ever shows up here, it means
-# the exploration stage missed it — fix it up there, not down here.
+# the exploration stage missed it.
 remaining = model_df.isnull().sum()
 remaining = remaining[remaining > 0]
 if remaining.empty:
     print("  No missing values remain — no further imputation applied.")
 else:
-    print("  Columns still missing values (revisit Deliverable 1):")
+    print("  Columns still missing values:")
     print(remaining)
 
 
-# 4. FEATURE SELECTION — WITH JUSTIFICATION
+# 4. FEATURE SELECTION
 print("\n4. FEATURE SELECTION")
 
 # 4a. Post-incident outcome columns — DROP (data leakage)
@@ -400,7 +391,7 @@ print(f"\nModelling frame shape after transformations: {model_df.shape}")
 print(f"Feature types:\n{model_df.dtypes.value_counts()}")
 
 
-# 6. TRAIN / TEST SPLIT (STRATIFIED)
+# 6. TRAIN / TEST SPLIT
 print("\n6. TRAIN / TEST SPLIT")
 
 X = model_df.drop(columns=["ACCLASS_BINARY"])
@@ -490,43 +481,43 @@ print(f"\n  Resampled training shape: {X_train_resampled.shape}")
 print(f"  Test set left untouched:  {X_test_processed.shape}")
 
 
-# SUMMARY
-print("\nDELIVERABLE 2 — SUMMARY")
-print(f"""
-  Records after exploration cleaning: {df.shape[0]}
-  Records used for modelling:         {model_df.shape[0]}
-  Features selected:                  {X.shape[1]}
-  Features after encoding:            {X_train_processed.shape[1]}
-
-  Target: ACCLASS_BINARY (Fatal=1, Non-Fatal=0)
-
-  Missing data: fully handled in Deliverable 1 (Groups 1-6); the modelling
-    stage only verifies it and never re-imputes.
-
-  Feature selection:
-    Leakage dropped     -> INJURY, FATAL_NO
-    Sparse dropped      -> pedestrian/cyclist detail columns, MANOEUVER,
-                           DRIVACT, DRIVCOND, OFFSET
-    Identifiers dropped -> OBJECTID, INDEX, ACCNUM, STREET1/2, DATE, x, y
-    Redundant dropped   -> NEIGHBOURHOOD_158/140, HOOD_140, ACCLASS
-
-  Categorical encoding:
-    Binary flags          -> 0/1 integers
-    Multi-category        -> OneHotEncoder (inside the pipeline)
-    Rare categories (<1%) -> grouped into 'Other'
-
-  Normalization: StandardScaler on numeric features (inside the pipeline)
-
-  Train/Test split: 80/20, stratified by target
-    Train: {X_train.shape[0]} samples
-    Test:  {X_test.shape[0]} samples
-
-  Class imbalance: SMOTE on training data only
-    Before: {dict(Counter(y_train))}
-    After:  {dict(Counter(y_train_resampled))}
-
-  Pipeline: ColumnTransformer(
-    numeric     -> SimpleImputer(median) -> StandardScaler
-    categorical -> SimpleImputer(mode)   -> OneHotEncoder
-  )
-""")
+# SUMMARY - Summary of what has been done in data modeling (Stats)
+# print("\nDELIVERABLE 2 — SUMMARY")
+# print(f"""
+#  Records after exploration cleaning: {df.shape[0]}
+#  Records used for modelling:         {model_df.shape[0]}
+#  Features selected:                  {X.shape[1]}
+#  Features after encoding:            {X_train_processed.shape[1]}
+#
+#  Target: ACCLASS_BINARY (Fatal=1, Non-Fatal=0)
+#
+#  Missing data: fully handled in Deliverable 1 (Groups 1-6); the modelling
+#    stage only verifies it and never re-imputes.
+#
+#  Feature selection:
+#    Leakage dropped     -> INJURY, FATAL_NO
+#    Sparse dropped      -> pedestrian/cyclist detail columns, MANOEUVER,
+#                           DRIVACT, DRIVCOND, OFFSET
+#    Identifiers dropped -> OBJECTID, INDEX, ACCNUM, STREET1/2, DATE, x, y
+#    Redundant dropped   -> NEIGHBOURHOOD_158/140, HOOD_140, ACCLASS
+#
+#  Categorical encoding:
+#    Binary flags          -> 0/1 integers
+#    Multi-category        -> OneHotEncoder (inside the pipeline)
+#    Rare categories (<1%) -> grouped into 'Other'
+#
+#  Normalization: StandardScaler on numeric features (inside the pipeline)
+#
+#  Train/Test split: 80/20, stratified by target
+#    Train: {X_train.shape[0]} samples
+#    Test:  {X_test.shape[0]} samples
+#
+#  Class imbalance: SMOTE on training data only
+#    Before: {dict(Counter(y_train))}
+#    After:  {dict(Counter(y_train_resampled))}
+#
+#  Pipeline: ColumnTransformer(
+#    numeric     -> SimpleImputer(median) -> StandardScaler
+#    categorical -> SimpleImputer(mode)   -> OneHotEncoder
+#  )
+#""")
