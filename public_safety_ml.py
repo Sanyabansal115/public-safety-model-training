@@ -1,4 +1,6 @@
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 df = pd.read_csv("KSI_data.csv")
@@ -185,6 +187,72 @@ df.loc[~mask_present, "INJURY"] = df.loc[~mask_present, "INJURY"].fillna("Not Ap
 print(df.isnull().sum())
 
 
+# =============================================================================
+# DELIVERABLE 1B — DATA VISUALIZATION
+# =============================================================================
+# Exploratory charts built on the cleaned frame from the exploration section
+# above. No modelling transformations (encoding, scaling, feature drops) have
+# happened yet, so these plots reflect the raw-but-cleaned KSI data.
+
+# 1. Collisions per year, split by severity
+yearly = df.groupby(["YEAR", "ACCLASS"]).size().unstack(fill_value=0)
+fig, ax = plt.subplots(figsize=(10, 5.5))
+yearly.plot(kind="bar", stacked=True, ax=ax,
+            color=["#d62728", "#1f77b4", "#7f7f7f"])
+ax.set_title("Killed or Seriously Injured Collisions by Year and Severity")
+ax.set_xlabel("Year")
+ax.set_ylabel("Number of Collisions")
+ax.legend(title="Severity")
+plt.tight_layout()
+plt.savefig("1_collisions_by_year_severity.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# 2. Collisions by hour of day
+fig, ax = plt.subplots(figsize=(10, 5))
+sns.countplot(x="HOUR", data=df, hue="ACCLASS", ax=ax,
+              palette={"Fatal": "#d62728", "Non-Fatal Injury": "#1f77b4",
+                       "Property Damage O": "#7f7f7f"})
+ax.set_title("Collisions by Hour of Day")
+ax.set_xlabel("Hour (24h)")
+ax.set_ylabel("Number of Collisions")
+plt.tight_layout()
+plt.savefig("2_collisions_by_hour.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# 3. Contributing factors (Yes counts across binary flags)
+factor_cols = ["SPEEDING", "AG_DRIV", "REDLIGHT", "ALCOHOL", "DISABILITY"]
+factor_counts = {c: (df[c] == "Yes").sum() for c in factor_cols}
+factor_series = pd.Series(factor_counts).sort_values(ascending=True)
+fig, ax = plt.subplots(figsize=(9, 5))
+factor_series.plot(kind="barh", ax=ax, color="#c44e52")
+ax.set_title("Collisions Involving Each Contributing Factor")
+ax.set_xlabel("Number of Collisions")
+plt.tight_layout()
+plt.savefig("3_contributing_factors.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# 4. Correlation heatmap of binary contributing/involvement factors
+bin_cols = ["PEDESTRIAN", "CYCLIST", "AUTOMOBILE", "MOTORCYCLE", "TRUCK",
+            "SPEEDING", "AG_DRIV", "REDLIGHT", "ALCOHOL", "DISABILITY"]
+bin_df = df[bin_cols].apply(lambda s: (s == "Yes").astype(int))
+corr = bin_df.corr()
+fig, ax = plt.subplots(figsize=(9, 7.5))
+sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, ax=ax,
+            square=True, cbar_kws={"label": "Correlation"})
+ax.set_title("Correlation Between Contributing Factors")
+plt.tight_layout()
+plt.savefig("4_correlation_heatmap.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# 5. Top 10 neighbourhoods by collision count
+top_nbhd = df["NEIGHBOURHOOD_140"].value_counts().nlargest(10).sort_values()
+fig, ax = plt.subplots(figsize=(9, 5.5))
+top_nbhd.plot(kind="barh", ax=ax, color="#dd8452")
+ax.set_title("Top 10 Neighbourhoods by Collision Count")
+ax.set_xlabel("Number of Collisions")
+plt.tight_layout()
+plt.savefig("5_top_neighbourhoods.png", dpi=300, bbox_inches="tight")
+plt.show()
 
 
 # =============================================================================
