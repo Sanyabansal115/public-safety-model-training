@@ -1,6 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.model_selection import GroupShuffleSplit
 
 
 df = pd.read_csv("KSI_data.csv")
@@ -358,7 +359,6 @@ sparse_cols.update({
 identifier_cols = {
     "OBJECTID": "Row identifier — no predictive value",
     "INDEX": "Row identifier — no predictive value",
-    "ACCNUM": "Accident number — unique ID (placeholder -1 above), no predictive value",
     "STREET1": "~4600 unique values; location already captured by HOOD_158 and DISTRICT",
     "STREET2": "Too many unique values; location already captured by HOOD_158 and DISTRICT",
     "ACCLASS": "Original target label — replaced by binary ACCLASS_BINARY",
@@ -481,13 +481,29 @@ categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
 print(f"Numeric features ({len(numeric_features)}): {numeric_features}")
 print(f"Categorical features ({len(categorical_features)}): {categorical_features}")
 
-# 80/20 split; stratify=y keeps the Fatal/Non-Fatal ratio in both sets
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y,
-)
+# Extract crash-level groups BEFORE dropping ACCNUM from X
+groups = X["ACCNUM"]
+
+# Now drop ACCNUM from X — it's not a predictive feature
+X = X.drop(columns=["ACCNUM"])
+
+# Re-identify column types AFTER dropping ACCNUM
+numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
+
+# Split by crash ID — whole crashes stay together in train OR test, never split
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, test_idx = next(gss.split(X, y, groups=groups))
+
+X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+print(f"\nTraining set: {X_train.shape[0]} samples")
+print(f"  Non-Fatal (0): {(y_train == 0).sum()} ({(y_train == 0).mean() * 100:.1f}%)")
+print(f"  Fatal     (1): {(y_train == 1).sum()} ({(y_train == 1).mean() * 100:.1f}%)")
+print(f"\nTest set: {X_test.shape[0]} samples")
+print(f"  Non-Fatal (0): {(y_test == 0).sum()} ({(y_test == 0).mean() * 100:.1f}%)")
+print(f"  Fatal     (1): {(y_test == 1).sum()} ({(y_test == 1).mean() * 100:.1f}%)")
 
 print(f"\nTraining set: {X_train.shape[0]} samples")
 print(f"  Non-Fatal (0): {(y_train == 0).sum()} ({(y_train == 0).mean() * 100:.1f}%)")
