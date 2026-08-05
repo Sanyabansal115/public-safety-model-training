@@ -39,6 +39,8 @@ Frame this as a **binary classification problem**:
 
 **`KSI_data.csv`** — Toronto Police Service KSI collision records, spanning 2006–present.
 
+**Row structure — important:** each row represents one *person* involved in a collision, not one collision. A crash with a driver, a passenger, and a pedestrian produces three rows sharing the same `ACCNUM` (collision ID), each with a different `INVTYPE`. The dataset's ~18,900 rows correspond to roughly half that many actual distinct collisions. This matters throughout the pipeline — most importantly for the train/test split (Section 6).
+
 Key feature groups:
 - **Collision details:** `ACCLASS`, `ACCLOC`, `IMPACTYPE`, `ROAD_CLASS`, `TRAFFCTL`
 - **Environmental conditions:** `LIGHT`, `VISIBILITY`, `RDSFCOND`
@@ -76,7 +78,7 @@ The pipeline runs in three deliberate stages, in this order:
 | **2 — Role-conditional attributes** | `PEDTYPE`, `PEDACT`, `CYCLISTYPE` | `fillna("Not Applicable")` | Only relevant to pedestrians/cyclists — doesn't apply to a driver-only record |
 | **3 — Event-conditional (`FATAL_NO`)** | `FATAL_NO` | `fillna(0)` | Only populated for fatal collisions |
 | **4 — Genuinely missing reports** | `ACCLOC`, `INITDIR`, `ROAD_CLASS` | Drop (<3%) or `"Unknown"` (~28%) | Real reporting gaps, handled by size of the gap |
-| **5 — Identifiers / low-value fields** | `OFFSET`, `STREET2`, `ACCNUM` | Fill or drop | Location/ID descriptors, not analytical signal |
+| **5 — Identifiers / low-value fields** | `OFFSET`, `STREET2`, `ACCNUM` | Fill or drop | Location/ID descriptors, not analytical signal. Missing `ACCNUM` values each get a unique placeholder rather than a shared one, so unrelated records are never mistaken for the same collision downstream |
 | **6 — Role-dependent `INJURY`** | `INJURY` | Conditional fill by `INVTYPE` | "None" for people present at the scene; "Not Applicable" for bystander roles |
 
 ### Stage 2 — Data Visualization
@@ -94,10 +96,10 @@ Builds directly on the cleaned exploration output (no re-loading or re-imputing)
 1. **Target preparation** — collapses the 3-class outcome into a binary `Fatal` vs `Non-Fatal` target.
 2. **Leakage removal** — drops any column that describes the outcome itself (`INJURY`, `FATAL_NO`), since including these would let the model "cheat" rather than predict from causal/contextual factors.
 3. **Feature selection with justification** — every dropped and kept column is documented with a business/statistical reason (sparsity, redundancy, or genuine predictive relevance).
-4. **Feature engineering** — extracts `HOUR` from raw `TIME`, groups rare categories (<1%) into `"Other"` to avoid noisy one-hot columns, and encodes binary flags as 0/1.
-5. **Stratified 80/20 train/test split** — preserves the real-world fatal/non-fatal ratio in both sets so evaluation reflects reality.
+4. **Feature engineering** — extracts `HOUR` from raw `TIME` and `YEAR` from `DATE`, groups rare categories (<1%) into `"Other"` to avoid noisy one-hot columns, and encodes binary flags as 0/1.
+5. **Crash-grouped 80/20 train/test split** — because each row is a *person*, not a collision, a plain random split can place different people from the *same crash* on both sides of the split, letting the model see near-duplicate rows (identical time, location, weather) during training and testing. To prevent this, the split uses `GroupShuffleSplit` on `ACCNUM`, so every row belonging to a given collision lands entirely in train or entirely in test, never both. This is a deliberate departure from a plain stratified split — it costs the ability to guarantee an exact class ratio in both sets, but it removes a real leakage path that a row-level split would otherwise hide.
 6. **Preprocessing pipeline** — numeric features are median-imputed and standardized; categorical features are mode-imputed and one-hot encoded, all inside a single `ColumnTransformer` fit only on training data (no test-set leakage).
-7. **Class imbalance handling (SMOTE)** — fatal collisions are a small minority of all KSI records. SMOTE is applied **only to the training set** to avoid inflating evaluation metrics with synthetic test data, since a model that just predicts "non-fatal" every time would score misleadingly well on accuracy without being useful to any stakeholder.
+7. **Class imbalance handling (SMOTE)** — fatal collisions are a small minority of all KSI records (roughly 6:1 non-fatal to fatal). SMOTE is applied **only to the training set** to avoid inflating evaluation metrics with synthetic test data, since a model that just predicts "non-fatal" every time would score misleadingly well on accuracy without being useful to any stakeholder.
 
 ## 7. Requirements
 
@@ -124,7 +126,7 @@ python public_safety_ml.py
 Running the script will:
 1. Print exploration and missing-value diagnostics to the console.
 2. Generate and save the five visualization PNGs listed above.
-3. Print the full modelling pipeline output — feature selection reasoning, train/test split summary, and class-balance verification.
+3. Print the full modelling pipeline output — feature selection reasoning, crash-grouped train/test split summary, and class-balance verification.
 
 ## 9. Course
 

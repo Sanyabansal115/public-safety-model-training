@@ -140,7 +140,9 @@ group5_cols = [
     "VEHTYPE"]
 
 df[group5_cols] = df[group5_cols].fillna("Unkown")
-df["ACCNUM"] = df["ACCNUM"].fillna(-1)  # temporary placeholder
+
+missing_accnum_mask = df["ACCNUM"].isnull()
+df.loc[missing_accnum_mask, "ACCNUM"] = -1 * (df.loc[missing_accnum_mask].index + 1)
 
 print(df[group5_cols].isnull().sum())
 print("ACCNUM ", df["ACCNUM"].isnull().sum())
@@ -186,6 +188,10 @@ df.loc[mask_present, "INJURY"] = df.loc[mask_present, "INJURY"].fillna("None")
 df.loc[~mask_present, "INJURY"] = df.loc[~mask_present, "INJURY"].fillna("Not Applicable")
 
 print(df.isnull().sum())
+
+df["DATE_PARSED"] = pd.to_datetime(df["DATE"])
+df["YEAR"] = df["DATE_PARSED"].dt.year
+df["HOUR"] = df["TIME"] // 100
 
 
 # =============================================================================
@@ -268,7 +274,6 @@ plt.show()
 import numpy as np
 from collections import Counter
 
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -356,6 +361,8 @@ sparse_cols.update({
 })
 
 # 4c. Identifiers and redundant columns — DROP
+# ACCNUM is deliberately NOT in this dict — Section 6 pulls it out separately
+# as the grouping key for the train/test split, then drops it from X after.
 identifier_cols = {
     "OBJECTID": "Row identifier — no predictive value",
     "INDEX": "Row identifier — no predictive value",
@@ -368,6 +375,8 @@ identifier_cols = {
     "x": "Projected x-coordinate — redundant with LONGITUDE",
     "y": "Projected y-coordinate — redundant with LATITUDE",
     "DATE": "Raw date string — the usable temporal signal is extracted as HOUR from TIME",
+    "DATE_PARSED": "Intermediate column used only to compute YEAR — not a feature",
+    "YEAR": "Used for the exploration chart, not carried into modelling as a feature",
 }
 
 drop_cols = {**leakage_cols, **sparse_cols, **identifier_cols}
@@ -468,13 +477,21 @@ print(f"\nModelling frame shape after transformations: {model_df.shape}")
 print(f"Feature types:\n{model_df.dtypes.value_counts()}")
 
 
-# 6. TRAIN / TEST SPLIT (STRATIFIED)
+# 6. TRAIN / TEST SPLIT (GROUPED BY CRASH, NOT STRATIFIED)
 print("\n6. TRAIN / TEST SPLIT")
 
 X = model_df.drop(columns=["ACCLASS_BINARY"])
 y = model_df["ACCLASS_BINARY"]
 
-# Identify column types for the ColumnTransformer
+# Extract crash-level groups BEFORE dropping ACCNUM from X. Each ACCNUM now
+# maps to exactly one real crash (Fix 2, above) — no more shared -1 mega-group.
+groups = X["ACCNUM"]
+
+# Now drop ACCNUM from X — it's an ID, not a predictive feature
+X = X.drop(columns=["ACCNUM"])
+
+# Identify column types for the ColumnTransformer (done once, after the drop,
+# so numeric_features/categorical_features never include ACCNUM)
 numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
 categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
 
@@ -492,18 +509,15 @@ numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
 categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
 
 # Split by crash ID — whole crashes stay together in train OR test, never split
+# across both. GroupShuffleSplit does NOT stratify by y — it only respects
+# groups — so the Fatal ratio below is a result, not a guarantee.
 gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
 train_idx, test_idx = next(gss.split(X, y, groups=groups))
 
 X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
 y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-print(f"\nTraining set: {X_train.shape[0]} samples")
-print(f"  Non-Fatal (0): {(y_train == 0).sum()} ({(y_train == 0).mean() * 100:.1f}%)")
-print(f"  Fatal     (1): {(y_train == 1).sum()} ({(y_train == 1).mean() * 100:.1f}%)")
-print(f"\nTest set: {X_test.shape[0]} samples")
-print(f"  Non-Fatal (0): {(y_test == 0).sum()} ({(y_test == 0).mean() * 100:.1f}%)")
-print(f"  Fatal     (1): {(y_test == 1).sum()} ({(y_test == 1).mean() * 100:.1f}%)")
+
 
 print(f"\nTraining set: {X_train.shape[0]} samples")
 print(f"  Non-Fatal (0): {(y_train == 0).sum()} ({(y_train == 0).mean() * 100:.1f}%)")
@@ -511,7 +525,9 @@ print(f"  Fatal     (1): {(y_train == 1).sum()} ({(y_train == 1).mean() * 100:.1
 print(f"\nTest set: {X_test.shape[0]} samples")
 print(f"  Non-Fatal (0): {(y_test == 0).sum()} ({(y_test == 0).mean() * 100:.1f}%)")
 print(f"  Fatal     (1): {(y_test == 1).sum()} ({(y_test == 1).mean() * 100:.1f}%)")
-print(f"\n  Stratification verified — both sets hold ~{(y == 1).mean() * 100:.1f}% Fatal")
+print(f"\n  Split by ACCNUM (GroupShuffleSplit), not stratified — Fatal ratio")
+print(f"  above is a result of the crash-level split, not an enforced target.")
+print(f"  Overall Fatal rate in the full dataset: {(y == 1).mean() * 100:.1f}%")
 
 
 # 7. PREPROCESSING PIPELINE (ColumnTransformer)
@@ -591,7 +607,8 @@ print(f"""
     Leakage dropped     -> INJURY, FATAL_NO
     Sparse dropped      -> pedestrian/cyclist detail columns, MANOEUVER,
                            DRIVACT, DRIVCOND, OFFSET
-    Identifiers dropped -> OBJECTID, INDEX, ACCNUM, STREET1/2, DATE, x, y
+    Identifiers dropped -> OBJECTID, INDEX, ACCNUM (used as split group first),
+                           STREET1/2, DATE, x, y
     Redundant dropped   -> NEIGHBOURHOOD_158/140, HOOD_140, ACCLASS
 
   Categorical encoding:
@@ -601,7 +618,8 @@ print(f"""
 
   Normalization: StandardScaler on numeric features (inside the pipeline)
 
-  Train/Test split: 80/20, stratified by target
+  Train/Test split: 80/20 by crash (ACCNUM), via GroupShuffleSplit — no crash
+    is split across train and test
     Train: {X_train.shape[0]} samples
     Test:  {X_test.shape[0]} samples
 
