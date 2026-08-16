@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+train_run.log
+app_run.log

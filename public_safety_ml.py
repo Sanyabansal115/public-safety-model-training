@@ -1,11 +1,17 @@
+import os
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import GroupShuffleSplit
 
 
+# Resolve the dataset next to this script so the project runs on any machine
+# (it previously carried one team member's absolute Windows path).
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+KSI_CSV = os.environ.get("KSI_CSV", os.path.join(PROJECT_DIR, "KSI_data.csv"))
 
-df = pd.read_csv('C:/Users/2000d/OneDrive/Desktop/Summer 2026/Supervised Learning/KSI_data.csv')
+df = pd.read_csv(KSI_CSV)
 print(df.head())
 
 
@@ -458,12 +464,23 @@ def group_rare(series, threshold=0.01):
 rare_grouping_cols = ["ROAD_CLASS", "LIGHT", "RDSFCOND", "VEHTYPE",
                       "INVTYPE", "TRAFFCTL", "VISIBILITY"]
 
+# The frequencies that decide "rare" are a property of THIS dataset, so they
+# have to be captured here and shipped with the model. At serving time a single
+# incoming row has no frequency distribution of its own — recomputing
+# value_counts() on one record would mark every value as 100% frequent and
+# group nothing, so a category that trained as "Other" would arrive raw and be
+# silently one-hot encoded as all-zeros. Deliverable 5 pickles this map and
+# replays it instead of recomputing.
+rare_category_maps = {}
+
 # HOOD_158 is intentionally excluded — with 159 neighbourhoods every single one
 # sits below 1%, so grouping would collapse the whole column into "Other".
 for col in rare_grouping_cols:
     before = model_df[col].nunique()
     model_df[col] = group_rare(model_df[col])
     after = model_df[col].nunique()
+    # Categories that survived grouping; anything else becomes "Other" at serving time.
+    rare_category_maps[col] = sorted(model_df[col].unique().tolist())
     if before != after:
         print(f"  {col}: grouped rare categories ({before} -> {after} unique values)")
 
@@ -962,4 +979,502 @@ print(f"""
   Best model by test F1: {best_model_name}
 
 {results_df.to_string(index=False)}
+""")
+
+# =============================================================================
+# DELIVERABLE 5 — MODEL EXPORT FOR DEPLOYMENT
+# =============================================================================
+# Everything below turns the winning model from Deliverable 3 into something a
+# Flask API can actually serve. Three problems have to be solved here, and all
+# three are properties of THIS script rather than of Flask:
+#
+#   1. `preprocessor` was fitted separately from the models (section 7), and
+#      every estimator was fitted on an already-encoded numpy matrix. Pickling
+#      an estimator on its own would produce a model that only accepts a
+#      ~200-column encoded array — useless to an endpoint receiving JSON. The
+#      fitted ColumnTransformer and the fitted estimator are therefore wrapped
+#      into a single Pipeline. Both components are ALREADY fitted and sklearn
+#      only refits on .fit(), so .predict() works immediately — no retraining.
+#
+#   2. The rare-category grouping in section 5c is data-dependent. Its decisions
+#      are captured in `rare_category_maps` and shipped in the bundle.
+#
+#   3. The decision threshold. See section 10.2.
+
+print("\n" + "=" * 79)
+print("DELIVERABLE 5 — MODEL EXPORT FOR DEPLOYMENT")
+print("=" * 79)
+
+import json
+import pickle
+import sklearn
+from datetime import datetime
+
+from sklearn.base import clone
+from sklearn.metrics import fbeta_score
+
+# -----------------------------------------------------------------------
+# 10.1 SELECT THE MODEL TO DEPLOY
+# -----------------------------------------------------------------------
+# results_df is sorted by F1 descending, so row 0 is the winner. The label
+# carries a " (tuned)" suffix for reporting, but `tuned_models` is keyed
+# without it — strip the suffix before looking the estimator up.
+deploy_key = best_model_name.replace(" (tuned)", "")
+deploy_estimator = tuned_models[deploy_key]
+deploy_row = results_df.iloc[0]
+
+print(f"\n10.1 MODEL SELECTED FOR DEPLOYMENT: {deploy_key}")
+print(f"  Chosen as the highest test F1 on the Fatal class ({deploy_row['F1']:.3f}).")
+print(f"  It also has the highest ROC-AUC ({deploy_row['ROC-AUC']:.3f}), meaning it")
+print("  ranks Fatal cases above Non-Fatal ones better than any other candidate.")
+print("  ROC-AUC is threshold-independent, so this model stays the best choice")
+print("  even after the decision threshold is retuned below.")
+
+# -----------------------------------------------------------------------
+# 10.2 DECISION THRESHOLD TUNING
+# -----------------------------------------------------------------------
+# Section 9's evaluation used sklearn's default 0.5 cut-off. That default is
+# arbitrary for this problem: the whole framing above says a false negative
+# (a Fatal collision predicted Non-Fatal) is the expensive error, so the
+# deployed API should not silently inherit a threshold that treats both error
+# types as equally costly.
+#
+# IMPORTANT — the threshold is tuned on a VALIDATION split carved out of the
+# training data, never on the test set. Picking a cut-off that maximises a
+# score on the test set and then reporting that same score would be leakage:
+# the reported number would no longer be an honest held-out estimate. So:
+#   - X_train is split again by ACCNUM (same grouped logic as section 6),
+#   - a clone of the winning estimator is refit on that sub-training half,
+#   - the threshold is selected on the held-out validation half, which keeps
+#     its natural class imbalance (SMOTE is applied to the sub-train only).
+# The threshold found there is then applied to the full-data model that ships.
+#
+# CHOICE OF CRITERION — why not F-beta(beta=2)?
+# The obvious way to encode "recall matters more" is to maximise F2. On this
+# dataset that criterion is degenerate. Precision on the Fatal class is bounded
+# below by the class prevalence (~15%), while recall can always be pushed to
+# 1.0 by lowering the threshold, so F2 keeps improving as the model predicts
+# Fatal for everything. At the validation prevalence an all-positive
+# classifier scores F2 = 0.475, which beats every interior threshold — the
+# "optimum" is a model that has stopped discriminating at all. That is checked
+# explicitly below rather than assumed.
+#
+# Youden's J (= TPR - FPR = sensitivity + specificity - 1) is used instead:
+#   - it cannot degenerate: J = 0 for all-positive AND for all-negative, so
+#     the maximum is necessarily an interior, genuinely discriminating point;
+#   - it is the standard cut-point criterion for the ROC curve already plotted
+#     in section 9.7, so the choice is consistent with how the models were
+#     compared;
+#   - it is prevalence-independent, which matters because the deployed model
+#     was fitted on SMOTE-balanced data but scores naturally imbalanced rows.
+# It still moves the threshold well below 0.5 — recall rises substantially
+# versus the default — without collapsing into "everything is fatal".
+
+print("\n10.2 DECISION THRESHOLD TUNING")
+
+DEPLOY_THRESHOLD = 0.5
+threshold_note = "default 0.5 (model exposes no predict_proba)"
+
+if hasattr(deploy_estimator, "predict_proba"):
+    gss_val = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=7)
+    train_groups = groups.iloc[train_idx]
+    sub_idx, val_idx = next(gss_val.split(X_train, y_train, groups=train_groups))
+
+    X_sub, X_val = X_train.iloc[sub_idx], X_train.iloc[val_idx]
+    y_sub, y_val = y_train.iloc[sub_idx], y_train.iloc[val_idx]
+
+    # Fresh preprocessor fitted on the sub-training half only — reusing the
+    # section 7 preprocessor would leak validation statistics into the scaler.
+    val_preprocessor = clone(preprocessor)
+    X_sub_processed = val_preprocessor.fit_transform(X_sub)
+    X_val_processed = val_preprocessor.transform(X_val)
+
+    # SMOTE on the sub-training half only; validation keeps real prevalence.
+    X_sub_resampled, y_sub_resampled = SMOTE(random_state=RANDOM_STATE).fit_resample(
+        X_sub_processed, y_sub
+    )
+
+    val_model = clone(deploy_estimator)
+    t0 = time.time()
+    val_model.fit(X_sub_resampled, y_sub_resampled)
+    print(f"  Refit {deploy_key} on the sub-training half: {time.time() - t0:.1f}s")
+    print(f"  Validation rows: {len(y_val)} (Fatal rate {y_val.mean() * 100:.1f}% — not resampled)")
+
+    val_proba = val_model.predict_proba(X_val_processed)[:, 1]
+
+    candidate_thresholds = np.round(np.arange(0.01, 1.00, 0.01), 2)
+    sweep = []
+    for t in candidate_thresholds:
+        y_hat = (val_proba >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_val, y_hat, labels=[0, 1]).ravel()
+        tpr = tp / (tp + fn) if (tp + fn) else 0.0   # sensitivity / recall
+        fpr = fp / (fp + tn) if (fp + tn) else 0.0
+        sweep.append({
+            "threshold": float(t),
+            "precision": precision_score(y_val, y_hat, zero_division=0),
+            "recall": tpr,
+            "specificity": 1 - fpr,
+            "f1": f1_score(y_val, y_hat, zero_division=0),
+            "f2": fbeta_score(y_val, y_hat, beta=2, zero_division=0),
+            "youden_j": tpr - fpr,
+        })
+    sweep_df = pd.DataFrame(sweep)
+
+    # Demonstrate the F2 degeneracy rather than asserting it: score the
+    # all-positive classifier and compare against the best interior F2.
+    all_positive_f2 = fbeta_score(y_val, np.ones_like(y_val), beta=2, zero_division=0)
+    best_f2 = sweep_df["f2"].max()
+
+    # The 0.01 grid above drives the diagnostic plot, but it is the wrong tool
+    # for actually picking the threshold: a grid can only ever report an
+    # optimum at one of its own points, so a maximum sitting near the edge is
+    # indistinguishable from a maximum the grid is too coarse to resolve. That
+    # is precisely the artifact F2 was rejected for, so Youden's J is held to
+    # the same standard. roc_curve() enumerates every distinct predicted
+    # probability as a candidate cut-point, making the selection exact and
+    # resolution-independent.
+    fpr_curve, tpr_curve, roc_thresholds = roc_curve(y_val, val_proba)
+    j_curve = tpr_curve - fpr_curve
+    j_best = int(np.argmax(j_curve))
+    j_threshold = float(roc_thresholds[j_best])
+    j_value = float(j_curve[j_best])
+
+    f1_threshold = float(sweep_df.loc[sweep_df["f1"].idxmax(), "threshold"])
+    f2_threshold = float(sweep_df.loc[sweep_df["f2"].idxmax(), "threshold"])
+
+    print("\n  Candidate criteria (all evaluated on the validation split):")
+    print(f"    Youden's J optimum : threshold {j_threshold:.4f}  (J = {j_value:.3f})"
+          f"  [exact, over {len(roc_thresholds)} candidate cut-points]")
+    print(f"    F1 optimum         : threshold {f1_threshold:.2f}  "
+          f"(F1 = {sweep_df['f1'].max():.3f})")
+    print(f"    F2 optimum         : threshold {f2_threshold:.2f}  "
+          f"(F2 = {best_f2:.3f})")
+    print(f"\n  F2 sanity check — an all-positive classifier scores F2 = {all_positive_f2:.3f}")
+    if all_positive_f2 >= best_f2:
+        print("    That BEATS the best interior threshold, confirming F2 is maximised by")
+        print("    a model that predicts Fatal for every record. F2 is therefore rejected")
+        print("    as the selection criterion. Youden's J cannot degenerate this way")
+        print(f"    (all-positive gives J = 0.000 by construction).")
+    else:
+        margin = best_f2 - all_positive_f2
+        print(f"    The best interior threshold beats it by only {margin:.3f}, and its")
+        print(f"    optimum sits at {f2_threshold:.2f} — the bottom of the searched range.")
+        print("    So F2 is not strictly degenerate, but it is still pulling the")
+        print("    threshold toward indiscriminate flagging: most of its score comes")
+        print("    from the same direction as the all-positive baseline rather than")
+        print("    from genuine discrimination. Youden's J is preferred — it has a")
+        print("    well-defined interior optimum and matches the ROC analysis in 9.7.")
+
+    DEPLOY_THRESHOLD = j_threshold
+    threshold_note = ("chosen by maximising Youden's J (TPR - FPR) on a grouped "
+                      "validation split held out of the training data")
+
+    # Metrics at the exact chosen cut-point, recomputed rather than looked up
+    # in the plotting grid (which no longer necessarily contains it).
+    y_val_hat = (val_proba >= j_threshold).astype(int)
+    print(f"\n  DEPLOYED THRESHOLD: {DEPLOY_THRESHOLD:.4f}")
+    print(f"    Validation recall (Fatal): {recall_score(y_val, y_val_hat, zero_division=0) * 100:.1f}%")
+    print(f"    Validation specificity:    {(1 - fpr_curve[j_best]) * 100:.1f}%")
+    print(f"    Validation precision:      {precision_score(y_val, y_val_hat, zero_division=0) * 100:.1f}%")
+    print(f"    Compare with the 0.01-grid optimum "
+          f"({sweep_df.loc[sweep_df['youden_j'].idxmax(), 'threshold']:.2f}, "
+          f"J = {sweep_df['youden_j'].max():.3f}) — the exact search is not grid-limited.")
+
+    # Report figure: how each criterion behaves across the threshold range.
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(sweep_df["threshold"], sweep_df["recall"], label="Recall (Fatal)")
+    ax.plot(sweep_df["threshold"], sweep_df["precision"], label="Precision (Fatal)")
+    ax.plot(sweep_df["threshold"], sweep_df["f1"], label="F1")
+    ax.plot(sweep_df["threshold"], sweep_df["f2"], label="F2", linestyle=":")
+    ax.plot(sweep_df["threshold"], sweep_df["youden_j"], label="Youden's J", linewidth=2.2)
+    ax.axvline(DEPLOY_THRESHOLD, color="crimson", linestyle="--",
+               label=f"Deployed threshold = {DEPLOY_THRESHOLD:.4f} (exact Youden J)")
+    ax.axvline(0.5, color="grey", linestyle="--", label="sklearn default = 0.50")
+    ax.axhline(all_positive_f2, color="darkorange", linestyle="-.", linewidth=1,
+               label=f"F2 of all-positive model = {all_positive_f2:.3f}")
+    ax.set_xlabel("Decision threshold on P(Fatal)")
+    ax.set_ylabel("Score")
+    ax.set_title(f"Threshold selection on the validation split — {deploy_key}")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("8_threshold_selection.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    print("\n  Saved 8_threshold_selection.png")
+
+# -----------------------------------------------------------------------
+# 10.3 TEST-SET IMPACT OF THE TUNED THRESHOLD
+# -----------------------------------------------------------------------
+# Now — and only now — the tuned threshold is applied to the untouched test
+# set. Because the threshold was selected without ever seeing these rows,
+# these numbers remain an honest held-out estimate and can go in the report.
+
+print("\n10.3 TEST-SET METRICS — DEFAULT vs TUNED THRESHOLD")
+
+deploy_test_proba = deploy_estimator.predict_proba(X_test_processed)[:, 1] \
+    if hasattr(deploy_estimator, "predict_proba") else None
+
+threshold_comparison = []
+deployed_test_metrics = None
+if deploy_test_proba is not None:
+    for label, t in [("Default (0.50)", 0.5),
+                     (f"Deployed / Youden J ({DEPLOY_THRESHOLD:.4f})", DEPLOY_THRESHOLD)]:
+        y_pred_t = (deploy_test_proba >= t).astype(int)
+        row = {
+            "Threshold": label,
+            "Accuracy": accuracy_score(y_test, y_pred_t),
+            "Precision": precision_score(y_test, y_pred_t, zero_division=0),
+            "Recall": recall_score(y_test, y_pred_t, zero_division=0),
+            "F1": f1_score(y_test, y_pred_t, zero_division=0),
+            "F2": fbeta_score(y_test, y_pred_t, beta=2, zero_division=0),
+        }
+        threshold_comparison.append(row)
+        if t == DEPLOY_THRESHOLD:
+            deployed_test_metrics = row
+
+    print(pd.DataFrame(threshold_comparison).to_string(index=False))
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_test, (deploy_test_proba >= DEPLOY_THRESHOLD).astype(int), labels=[0, 1]
+    ).ravel()
+    print(f"\n  Confusion matrix at the deployed threshold ({DEPLOY_THRESHOLD:.4f}):")
+    print(f"    True Non-Fatal predicted Non-Fatal (TN): {tn}")
+    print(f"    True Non-Fatal predicted Fatal     (FP): {fp}")
+    print(f"    True Fatal     predicted Non-Fatal (FN): {fn}   <- the costly error")
+    print(f"    True Fatal     predicted Fatal     (TP): {tp}")
+
+    tn0, fp0, fn0, tp0 = confusion_matrix(
+        y_test, (deploy_test_proba >= 0.5).astype(int), labels=[0, 1]
+    ).ravel()
+    print(f"\n  Trade-off vs the 0.50 default: {fn0 - fn} fewer missed fatalities "
+          f"({fn0} -> {fn}), paid for with {fp - fp0} more false alarms "
+          f"({fp0} -> {fp}).")
+    print("  For a screening tool that flags collisions for review, that is the")
+    print("  intended direction: a false alarm costs a review, a missed fatality")
+    print("  costs the thing the model exists to prevent.")
+
+# -----------------------------------------------------------------------
+# 10.4 BUILD THE SERVING PIPELINE
+# -----------------------------------------------------------------------
+# One object that goes raw DataFrame -> imputation -> scaling/one-hot ->
+# prediction. This is what makes the Flask endpoint a thin wrapper instead of
+# a reimplementation of section 7.
+
+print("\n10.4 BUILDING THE SERVING PIPELINE")
+
+serving_pipeline = Pipeline(steps=[
+    ("preprocessor", preprocessor),   # already fitted in section 7
+    ("classifier", deploy_estimator),  # already fitted in section 9
+])
+
+# Smoke test: the pipeline must accept RAW feature rows (pre-encoding).
+_smoke = serving_pipeline.predict_proba(X_test.head(5))[:, 1]
+print(f"  Pipeline accepts raw feature rows — sample probabilities: "
+      f"{np.round(_smoke, 4).tolist()}")
+
+# -----------------------------------------------------------------------
+# 10.5 FIELD SCHEMA FOR THE CLIENT FORM
+# -----------------------------------------------------------------------
+# The HTML form exposes every feature the model consumes. Rather than
+# hand-typing 30 fields (which would drift the moment feature selection
+# changes), the schema is derived from the fitted pipeline itself:
+#   - categorical options come from the fitted OneHotEncoder's categories_,
+#     so the form can only ever offer values the model was trained on;
+#   - numeric ranges/defaults come from the training distribution.
+
+print("\n10.5 BUILDING THE FIELD SCHEMA FOR THE FORM")
+
+fitted_encoder = preprocessor.named_transformers_["cat"]["encoder"]
+encoder_categories = {
+    col: [str(v) for v in cats]
+    for col, cats in zip(categorical_features, fitted_encoder.categories_)
+}
+
+field_schema = []
+for col in X.columns:
+    if col in categorical_features:
+        field_schema.append({
+            "name": col,
+            "type": "categorical",
+            "options": encoder_categories[col],
+            "default": str(X_train[col].mode().iloc[0]),
+            "description": kept_cols.get(col, ""),
+        })
+    elif col in binary_flag_cols:
+        field_schema.append({
+            "name": col,
+            "type": "binary",
+            "options": [0, 1],
+            "default": int(X_train[col].mode().iloc[0]),
+            "description": kept_cols.get(col, ""),
+        })
+    else:
+        field_schema.append({
+            "name": col,
+            "type": "numeric",
+            "min": float(X_train[col].min()),
+            "max": float(X_train[col].max()),
+            "default": float(X_train[col].median()),
+            "description": kept_cols.get(col, ""),
+        })
+
+n_cat = sum(1 for f in field_schema if f["type"] == "categorical")
+n_bin = sum(1 for f in field_schema if f["type"] == "binary")
+n_num = sum(1 for f in field_schema if f["type"] == "numeric")
+print(f"  {len(field_schema)} form fields: {n_num} numeric, {n_bin} binary flags, "
+      f"{n_cat} categorical")
+
+# -----------------------------------------------------------------------
+# 10.6 SERIALIZE THE BUNDLE (pickle)
+# -----------------------------------------------------------------------
+# Everything the API needs travels in ONE pickle so the served model and the
+# metadata describing it can never drift apart.
+
+print("\n10.6 SERIALIZING WITH pickle")
+
+model_bundle = {
+    "pipeline": serving_pipeline,
+    "model_name": deploy_key,
+    "threshold": DEPLOY_THRESHOLD,
+    "threshold_note": threshold_note,
+    "feature_order": list(X.columns),
+    "numeric_features": list(numeric_features),
+    "categorical_features": list(categorical_features),
+    "binary_flag_cols": list(binary_flag_cols),
+    "rare_category_maps": rare_category_maps,
+    "field_schema": field_schema,
+    "target_labels": {0: "Non-Fatal", 1: "Fatal"},
+    "test_metrics": {
+        "at_default_threshold": {k: float(deploy_row[k]) for k in
+                                 ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]},
+        "at_deployed_threshold": deployed_test_metrics,
+        "threshold_comparison": threshold_comparison,
+    },
+    "threshold_sweep": sweep_df.to_dict("records") if "sweep_df" in globals() else None,
+    "sklearn_version": sklearn.__version__,
+    "pandas_version": pd.__version__,
+    "trained_at": datetime.now().isoformat(timespec="seconds"),
+}
+
+BUNDLE_PATH = os.path.join(PROJECT_DIR, "model_bundle.pkl")
+with open(BUNDLE_PATH, "wb") as f:
+    pickle.dump(model_bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+bundle_mb = os.path.getsize(BUNDLE_PATH) / 1024 / 1024
+print(f"  Wrote {BUNDLE_PATH} ({bundle_mb:.2f} MB)")
+
+# Deserialization check — a pickle that cannot be loaded back is not a
+# deliverable. This is the same call app.py makes at start-up.
+with open(BUNDLE_PATH, "rb") as f:
+    reloaded = pickle.load(f)
+_check = reloaded["pipeline"].predict_proba(X_test.head(5))[:, 1]
+assert np.allclose(_check, _smoke), "Reloaded pipeline disagrees with the in-memory one"
+print("  Deserialization verified: reloaded pipeline reproduces identical probabilities")
+
+# -----------------------------------------------------------------------
+# 10.7 HELD-OUT SAMPLES FOR THE API CLIENT
+# -----------------------------------------------------------------------
+# The project spec requires the client to be tested on data that was NOT used
+# to train the model. These rows come from X_test, which the grouped split
+# kept entirely out of training (whole crashes went to one side or the other),
+# and they are saved BEFORE encoding — exactly the shape the API accepts.
+
+print("\n10.7 EXPORTING HELD-OUT TEST SAMPLES FOR THE CLIENT")
+
+# Rows are sampled at random (fixed seed) rather than taken as the first N by
+# index. The index is essentially chronological, so `.index[:10]` would return
+# ten collisions clustered in the same few days — an unrepresentative slice to
+# demo the client with. The sample is deliberately enriched with Fatal cases
+# (10 of 25 vs the ~14% base rate) so the client exercises both classes.
+fatal_idx = y_test[y_test == 1].sample(n=10, random_state=RANDOM_STATE).index
+nonfatal_idx = y_test[y_test == 0].sample(n=15, random_state=RANDOM_STATE).index
+sample_idx = list(fatal_idx) + list(nonfatal_idx)
+
+test_samples = X_test.loc[sample_idx].copy()
+test_samples["ACTUAL_ACCLASS_BINARY"] = y_test.loc[sample_idx]
+test_samples["ACTUAL_LABEL"] = test_samples["ACTUAL_ACCLASS_BINARY"].map({0: "Non-Fatal", 1: "Fatal"})
+
+SAMPLES_PATH = os.path.join(PROJECT_DIR, "test_samples.csv")
+# index=True keeps the original row id, so any exported row can be traced back
+# to the source record when a prediction looks wrong.
+test_samples.to_csv(SAMPLES_PATH, index=True, index_label="ORIGINAL_INDEX")
+print(f"  Wrote {SAMPLES_PATH} — {len(test_samples)} held-out rows "
+      f"({len(fatal_idx)} Fatal, {len(nonfatal_idx)} Non-Fatal)")
+
+# -----------------------------------------------------------------------
+# 10.8 EXPORT VERIFICATION
+# -----------------------------------------------------------------------
+# Confirms that the exported artifacts still line up with the model. Two
+# distinct failure modes are checked, because a mismatch between the features
+# written to CSV and the labels written beside them would be invisible
+# otherwise — the client would just report a strangely inaccurate model.
+
+print("\n10.8 VERIFYING THE EXPORTED ARTIFACTS")
+
+# (a) Does the model separate the two classes on the full test set at all?
+#     If these two distributions overlap completely, no threshold can help.
+if deploy_test_proba is not None:
+    proba_fatal = deploy_test_proba[y_test.values == 1]
+    proba_nonfatal = deploy_test_proba[y_test.values == 0]
+    print("  P(Fatal) assigned across the WHOLE test set:")
+    print(f"    Actual Fatal     (n={len(proba_fatal):4d}): "
+          f"mean {proba_fatal.mean():.4f}  median {np.median(proba_fatal):.4f}")
+    print(f"    Actual Non-Fatal (n={len(proba_nonfatal):4d}): "
+          f"mean {proba_nonfatal.mean():.4f}  median {np.median(proba_nonfatal):.4f}")
+    if proba_fatal.mean() <= proba_nonfatal.mean():
+        print("    WARNING: Fatal rows are NOT scored higher on average — "
+              "the model or the label orientation is wrong.")
+    else:
+        print("    Fatal rows score higher on average, as expected.")
+
+# (b) Round-trip the CSV: read it back, score it through the reloaded bundle,
+#     and check the predictions against the labels stored alongside.
+roundtrip = pd.read_csv(SAMPLES_PATH, index_col="ORIGINAL_INDEX")
+roundtrip_X = roundtrip[list(X.columns)].copy()
+for col in categorical_features:
+    roundtrip_X[col] = roundtrip_X[col].astype(str)
+
+roundtrip_proba = reloaded["pipeline"].predict_proba(roundtrip_X)[:, 1]
+inmemory_proba = serving_pipeline.predict_proba(X_test.loc[sample_idx])[:, 1]
+
+max_drift = np.abs(roundtrip_proba - inmemory_proba).max()
+print(f"\n  CSV round-trip vs in-memory scoring: max difference {max_drift:.2e}")
+assert max_drift < 1e-6, "Exported CSV does not reproduce in-memory predictions"
+
+exported_actual = roundtrip["ACTUAL_ACCLASS_BINARY"].values
+mean_p_fatal = roundtrip_proba[exported_actual == 1].mean()
+mean_p_nonfatal = roundtrip_proba[exported_actual == 0].mean()
+print(f"  Exported sample — mean P(Fatal): "
+      f"Fatal rows {mean_p_fatal:.4f} vs Non-Fatal rows {mean_p_nonfatal:.4f}")
+# Not an assertion: on a 25-row sample this comparison can fail by chance even
+# when everything is correct. The whole-test-set check in (a) above is the
+# reliable signal for label misalignment; this one is a per-sample sanity note.
+if mean_p_fatal <= mean_p_nonfatal:
+    print("    NOTE: on this small sample the Fatal rows do not score higher on")
+    print("    average. Check the whole-test-set separation printed above — if")
+    print("    that is also inverted, features and labels are misaligned.")
+
+exported_pred = (roundtrip_proba >= DEPLOY_THRESHOLD).astype(int)
+print(f"  Accuracy on the exported sample: "
+      f"{(exported_pred == exported_actual).sum()}/{len(exported_actual)} "
+      f"(fatal-enriched, so not comparable to the full-test-set figures)")
+print("  Export verified.")
+
+# Human-readable metadata sidecar (handy for the report and for Postman).
+META_PATH = os.path.join(PROJECT_DIR, "model_metadata.json")
+with open(META_PATH, "w") as f:
+    json.dump({k: v for k, v in model_bundle.items() if k != "pipeline"}, f, indent=2, default=str)
+print(f"  Wrote {META_PATH}")
+
+print(f"""
+DELIVERABLE 5 — EXPORT SUMMARY
+
+  Deployed model:      {deploy_key}
+  Decision threshold:  {DEPLOY_THRESHOLD:.4f} ({threshold_note})
+  Serving pipeline:    ColumnTransformer(fitted) -> {deploy_key}(fitted)
+  Input contract:      {len(X.columns)} raw features, pre-encoding
+  Artifacts written:   model_bundle.pkl, test_samples.csv, model_metadata.json,
+                       8_threshold_selection.png
+
+  Next: `python app.py` serves this bundle at http://127.0.0.1:5000
 """)

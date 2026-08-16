@@ -1,0 +1,330 @@
+{
+  "info": {
+    "name": "KSI Collision Fatality API",
+    "description": "Deliverable 5 \u2014 client tests for the Flask analytics API serving the Neural Network model at threshold 0.0160.\n\nStart the API with `python app.py`, then run this collection.\n\nThe /predict bodies are real held-out test records that were never used to train the model; each request's description gives the recorded outcome so the prediction can be checked against it.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:5000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health check",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "pm.test(\"model is loaded\", () => pm.expect(pm.response.json().status).to.eql(\"ok\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Confirms the API is up and reports which model and threshold are loaded."
+      }
+    },
+    {
+      "name": "2. Field schema",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "pm.test(\"all features described\", () => pm.expect(pm.response.json().feature_order.length).to.eql(30));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/schema",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "schema"
+          ]
+        },
+        "description": "Lists all 30 features the model accepts, with valid categorical options and numeric ranges."
+      }
+    },
+    {
+      "name": "3. Held-out samples",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "pm.test(\"samples returned\", () => pm.expect(pm.response.json().count).to.be.above(0));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/samples",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "samples"
+          ]
+        },
+        "description": "Returns test-split records the model never trained on, with their true outcomes."
+      }
+    },
+    {
+      "name": "4. Predict \u2014 record with a FATAL outcome",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"returns a prediction\", () => pm.expect(body).to.have.property(\"prediction\"));",
+              "pm.test(\"returns a probability\", () => pm.expect(body.probability_fatal).to.be.a(\"number\"));",
+              "console.log(`${body.label} \u2014 P(fatal)=${body.probability_fatal}`);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ROAD_CLASS\": \"Major Arterial\",\n  \"DISTRICT\": \"Toronto and East York\",\n  \"LATITUDE\": 43.646311,\n  \"LONGITUDE\": -79.384059,\n  \"ACCLOC\": \"At Intersection\",\n  \"TRAFFCTL\": \"Traffic Signal\",\n  \"VISIBILITY\": \"Clear\",\n  \"LIGHT\": \"Dark, artificial\",\n  \"RDSFCOND\": \"Wet\",\n  \"IMPACTYPE\": \"Pedestrian Collisions\",\n  \"INVTYPE\": \"Pedestrian\",\n  \"INVAGE\": \"25 to 29\",\n  \"INITDIR\": \"Unknown\",\n  \"VEHTYPE\": \"Unkown\",\n  \"PEDESTRIAN\": 1,\n  \"CYCLIST\": 0,\n  \"AUTOMOBILE\": 1,\n  \"MOTORCYCLE\": 0,\n  \"TRUCK\": 0,\n  \"TRSN_CITY_VEH\": 0,\n  \"EMERG_VEH\": 0,\n  \"PASSENGER\": 1,\n  \"SPEEDING\": 0,\n  \"AG_DRIV\": 1,\n  \"REDLIGHT\": 1,\n  \"ALCOHOL\": 1,\n  \"DISABILITY\": 0,\n  \"HOOD_158\": 170,\n  \"DIVISION\": \"D52\",\n  \"HOUR\": 23\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/predict",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "predict"
+          ]
+        },
+        "description": "Held-out record #17777. Recorded outcome: Fatal."
+      }
+    },
+    {
+      "name": "5. Predict \u2014 record with a NON-FATAL outcome",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"returns a prediction\", () => pm.expect(body).to.have.property(\"prediction\"));",
+              "pm.test(\"returns a probability\", () => pm.expect(body.probability_fatal).to.be.a(\"number\"));",
+              "console.log(`${body.label} \u2014 P(fatal)=${body.probability_fatal}`);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"ROAD_CLASS\": \"Local\",\n  \"DISTRICT\": \"North York\",\n  \"LATITUDE\": 43.768745,\n  \"LONGITUDE\": -79.35689,\n  \"ACCLOC\": \"Unkown\",\n  \"TRAFFCTL\": \"No Control\",\n  \"VISIBILITY\": \"Clear\",\n  \"LIGHT\": \"Daylight\",\n  \"RDSFCOND\": \"Dry\",\n  \"IMPACTYPE\": \"Cyclist Collisions\",\n  \"INVTYPE\": \"Driver\",\n  \"INVAGE\": \"75 to 79\",\n  \"INITDIR\": \"West\",\n  \"VEHTYPE\": \"Automobile, Station Wagon\",\n  \"PEDESTRIAN\": 0,\n  \"CYCLIST\": 1,\n  \"AUTOMOBILE\": 1,\n  \"MOTORCYCLE\": 0,\n  \"TRUCK\": 0,\n  \"TRSN_CITY_VEH\": 0,\n  \"EMERG_VEH\": 0,\n  \"PASSENGER\": 0,\n  \"SPEEDING\": 0,\n  \"AG_DRIV\": 1,\n  \"REDLIGHT\": 0,\n  \"ALCOHOL\": 0,\n  \"DISABILITY\": 0,\n  \"HOOD_158\": 53,\n  \"DIVISION\": \"D33\",\n  \"HOUR\": 12\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/predict",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "predict"
+          ]
+        },
+        "description": "Held-out record #438. Recorded outcome: Non-Fatal."
+      }
+    },
+    {
+      "name": "6. Predict \u2014 partial input",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"returns a prediction\", () => pm.expect(body).to.have.property(\"prediction\"));",
+              "pm.test(\"returns a probability\", () => pm.expect(body.probability_fatal).to.be.a(\"number\"));",
+              "console.log(`${body.label} \u2014 P(fatal)=${body.probability_fatal}`);",
+              "pm.test(\"warns about defaults\", () => pm.expect(pm.response.json().warnings).to.be.an(\"array\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"INVTYPE\": \"Pedestrian\",\n  \"SPEEDING\": 0,\n  \"ALCOHOL\": 1,\n  \"LIGHT\": \"Dark, artificial\",\n  \"PEDESTRIAN\": 1\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/predict",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "predict"
+          ]
+        },
+        "description": "Only a handful of fields are supplied. The API fills the rest with training-set defaults and lists what it defaulted in `warnings`."
+      }
+    },
+    {
+      "name": "7. Predict \u2014 batch",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"five predictions\", () => pm.expect(body.count).to.eql(5));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"records\": [\n    {\n      \"ROAD_CLASS\": \"Major Arterial\",\n      \"DISTRICT\": \"Toronto and East York\",\n      \"LATITUDE\": 43.646311,\n      \"LONGITUDE\": -79.384059,\n      \"ACCLOC\": \"At Intersection\",\n      \"TRAFFCTL\": \"Traffic Signal\",\n      \"VISIBILITY\": \"Clear\",\n      \"LIGHT\": \"Dark, artificial\",\n      \"RDSFCOND\": \"Wet\",\n      \"IMPACTYPE\": \"Pedestrian Collisions\",\n      \"INVTYPE\": \"Pedestrian\",\n      \"INVAGE\": \"25 to 29\",\n      \"INITDIR\": \"Unknown\",\n      \"VEHTYPE\": \"Unkown\",\n      \"PEDESTRIAN\": 1,\n      \"CYCLIST\": 0,\n      \"AUTOMOBILE\": 1,\n      \"MOTORCYCLE\": 0,\n      \"TRUCK\": 0,\n      \"TRSN_CITY_VEH\": 0,\n      \"EMERG_VEH\": 0,\n      \"PASSENGER\": 1,\n      \"SPEEDING\": 0,\n      \"AG_DRIV\": 1,\n      \"REDLIGHT\": 1,\n      \"ALCOHOL\": 1,\n      \"DISABILITY\": 0,\n      \"HOOD_158\": 170,\n      \"DIVISION\": \"D52\",\n      \"HOUR\": 23\n    },\n    {\n      \"ROAD_CLASS\": \"Minor Arterial\",\n      \"DISTRICT\": \"Etobicoke York\",\n      \"LATITUDE\": 43.666945,\n      \"LONGITUDE\": -79.49949,\n      \"ACCLOC\": \"At Intersection\",\n      \"TRAFFCTL\": \"Pedestrian Crossover\",\n      \"VISIBILITY\": \"Clear\",\n      \"LIGHT\": \"Daylight\",\n      \"RDSFCOND\": \"Dry\",\n      \"IMPACTYPE\": \"Pedestrian Collisions\",\n      \"INVTYPE\": \"Driver\",\n      \"INVAGE\": \"55 to 59\",\n      \"INITDIR\": \"North\",\n      \"VEHTYPE\": \"Automobile, Station Wagon\",\n      \"PEDESTRIAN\": 1,\n      \"CYCLIST\": 0,\n      \"AUTOMOBILE\": 1,\n      \"MOTORCYCLE\": 0,\n      \"TRUCK\": 0,\n      \"TRSN_CITY_VEH\": 0,\n      \"EMERG_VEH\": 0,\n      \"PASSENGER\": 0,\n      \"SPEEDING\": 0,\n      \"AG_DRIV\": 1,\n      \"REDLIGHT\": 0,\n      \"ALCOHOL\": 0,\n      \"DISABILITY\": 0,\n      \"HOOD_158\": 111,\n      \"DIVISION\": \"D12\",\n      \"HOUR\": 9\n    },\n    {\n      \"ROAD_CLASS\": \"Local\",\n      \"DISTRICT\": \"North York\",\n      \"LATITUDE\": 43.708262,\n      \"LONGITUDE\": -79.42094,\n      \"ACCLOC\": \"Intersection Related\",\n      \"TRAFFCTL\": \"Stop Sign\",\n      \"VISIBILITY\": \"Clear\",\n      \"LIGHT\": \"Daylight\",\n      \"RDSFCOND\": \"Dry\",\n      \"IMPACTYPE\": \"Angle\",\n      \"INVTYPE\": \"Driver\",\n      \"INVAGE\": \"35 to 39\",\n      \"INITDIR\": \"East\",\n      \"VEHTYPE\": \"Automobile, Station Wagon\",\n      \"PEDESTRIAN\": 0,\n      \"CYCLIST\": 0,\n      \"AUTOMOBILE\": 1,\n      \"MOTORCYCLE\": 0,\n      \"TRUCK\": 0,\n      \"TRSN_CITY_VEH\": 0,\n      \"EMERG_VEH\": 0,\n      \"PASSENGER\": 0,\n      \"SPEEDING\": 1,\n      \"AG_DRIV\": 1,\n      \"REDLIGHT\": 0,\n      \"ALCOHOL\": 0,\n      \"DISABILITY\": 0,\n      \"HOOD_158\": 102,\n      \"DIVISION\": \"D53\",\n      \"HOUR\": 9\n    },\n    {\n      \"ROAD_CLASS\": \"Major Arterial\",\n      \"DISTRICT\": \"Etobicoke York\",\n      \"LATITUDE\": 43.600445,\n      \"LONGITUDE\": -79.50639,\n      \"ACCLOC\": \"At Intersection\",\n      \"TRAFFCTL\": \"No Control\",\n      \"VISIBILITY\": \"Clear\",\n      \"LIGHT\": \"Daylight\",\n      \"RDSFCOND\": \"Dry\",\n      \"IMPACTYPE\": \"Pedestrian Collisions\",\n      \"INVTYPE\": \"Vehicle Owner\",\n      \"INVAGE\": \"unknown\",\n      \"INITDIR\": \"Unkown\",\n      \"VEHTYPE\": \"Other\",\n      \"PEDESTRIAN\": 1,\n      \"CYCLIST\": 0,\n      \"AUTOMOBILE\": 1,\n      \"MOTORCYCLE\": 0,\n      \"TRUCK\": 0,\n      \"TRSN_CITY_VEH\": 0,\n      \"EMERG_VEH\": 0,\n      \"PASSENGER\": 0,\n      \"SPEEDING\": 0,\n      \"AG_DRIV\": 1,\n      \"REDLIGHT\": 0,\n      \"ALCOHOL\": 0,\n      \"DISABILITY\": 0,\n      \"HOOD_158\": 18,\n      \"DIVISION\": \"D22\",\n      \"HOUR\": 12\n    },\n    {\n      \"ROAD_CLASS\": \"Major Arterial\",\n      \"DISTRICT\": \"Scarborough\",\n      \"LATITUDE\": 43.750491,\n      \"LONGITUDE\": -79.254108,\n      \"ACCLOC\": \"Non Intersection\",\n      \"TRAFFCTL\": \"No Control\",\n      \"VISIBILITY\": \"Clear\",\n      \"LIGHT\": \"Dark, artificial\",\n      \"RDSFCOND\": \"Dry\",\n      \"IMPACTYPE\": \"Pedestrian Collisions\",\n      \"INVTYPE\": \"Pedestrian\",\n      \"INVAGE\": \"65 to 69\",\n      \"INITDIR\": \"West\",\n      \"VEHTYPE\": \"Unkown\",\n      \"PEDESTRIAN\": 1,\n      \"CYCLIST\": 0,\n      \"AUTOMOBILE\": 1,\n      \"MOTORCYCLE\": 0,\n      \"TRUCK\": 0,\n      \"TRSN_CITY_VEH\": 0,\n      \"EMERG_VEH\": 0,\n      \"PASSENGER\": 0,\n      \"SPEEDING\": 0,\n      \"AG_DRIV\": 0,\n      \"REDLIGHT\": 0,\n      \"ALCOHOL\": 0,\n      \"DISABILITY\": 0,\n      \"HOOD_158\": 157,\n      \"DIVISION\": \"D41\",\n      \"HOUR\": 17\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/predict/batch",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "predict",
+            "batch"
+          ]
+        },
+        "description": "Scores five held-out records in one request."
+      }
+    },
+    {
+      "name": "8. Predict \u2014 invalid input is rejected",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+              "pm.test(\"explains the problem\", () => pm.expect(pm.response.json().error).to.be.a(\"string\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"LATITUDE\": \"not-a-number\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/predict",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "predict"
+          ]
+        },
+        "description": "Bad input must produce a clear 400, not a stack trace or a silent guess."
+      }
+    }
+  ]
+}

@@ -55,18 +55,41 @@ A significant part of the work in this project is *not* the modelling itself, bu
 ```
 GroupProject/
 ├── KSI_data.csv                       # Toronto KSI collision dataset
-├── public_safety_ml.py                # Exploration -> Visualization -> Modelling pipeline
+├── public_safety_ml.py                # Exploration -> Visualization -> Modelling -> Export
+│
+├── app.py                             # Flask analytics API (Deliverable 5)
+├── model_service.py                   # Bundle loading + request-to-DataFrame preparation
+├── templates/index.html               # Jinja browser client — form over every model feature
+├── client.py                          # Python API client, tested on held-out data
+├── make_postman_collection.py         # Regenerates the Postman collection from the bundle
+├── postman_collection.json            # Importable Postman collection (8 requests)
+├── requirements.txt                   # Pinned dependencies
+├── DELIVERABLE_5_GUIDE.md             # Deployment walkthrough — run it, read the UI
+│
+├── model_bundle.pkl                   # Pickled serving pipeline + metadata  (generated)
+├── test_samples.csv                   # Held-out test rows for client testing (generated)
+├── model_metadata.json                # Human-readable bundle contents       (generated)
+│
 ├── 1_collisions_by_year_severity.png  # Yearly trend, by severity
 ├── 2_collisions_by_hour.png           # Hour-of-day risk profile
 ├── 3_contributing_factors.png         # Frequency of behavioural risk factors
 ├── 4_correlation_heatmap.png          # Relationships between contributing factors
 ├── 5_top_neighbourhoods.png           # Highest-collision neighbourhoods
+├── 6_roc_curves_all_models.png        # ROC comparison across all tuned models
+├── 7_feature_importance_rf.png        # Top 20 features (Random Forest)
+├── 8_threshold_selection.png          # Decision-threshold selection on validation
 └── README.md                          # Project documentation
 ```
 
+The four `(generated)` artifacts are written by `public_safety_ml.py`; the API
+will not start without `model_bundle.pkl`.
+
 ## 6. Methodology
 
-The pipeline runs in three deliberate stages, in this order:
+The pipeline runs in five deliberate stages, in this order. Each stage builds on
+the in-memory output of the one before it — nothing reloads the CSV or repeats
+an earlier transformation, so a decision justified once cannot be silently
+undone later:
 
 ### Stage 1 — Data Exploration & Cleaning
 - Profiles the dataset (shape, types, missingness, ranges) to understand what we're working with before touching it.
@@ -101,34 +124,280 @@ Builds directly on the cleaned exploration output (no re-loading or re-imputing)
 6. **Preprocessing pipeline** — numeric features are median-imputed and standardized; categorical features are mode-imputed and one-hot encoded, all inside a single `ColumnTransformer` fit only on training data (no test-set leakage).
 7. **Class imbalance handling (SMOTE)** — fatal collisions are a small minority of all KSI records (roughly 6:1 non-fatal to fatal). SMOTE is applied **only to the training set** to avoid inflating evaluation metrics with synthetic test data, since a model that just predicts "non-fatal" every time would score misleadingly well on accuracy without being useful to any stakeholder.
 
+### Stage 4 — Model Building & Evaluation
+
+Five algorithms are trained on the SMOTE-balanced training set and evaluated on
+the untouched, naturally imbalanced test set: logistic regression, decision
+tree, SVM, random forest, and a neural network (MLP). Hyperparameters are tuned
+with `GridSearchCV` where the search space is small and cheap (logistic
+regression, decision tree) and `RandomizedSearchCV` where an exhaustive grid
+would be impractical (SVM, random forest, MLP).
+
+Tuning is scored on **F1 for the Fatal class**, not accuracy. With a ~14% fatal
+rate, a model that predicts "Non-Fatal" for everything scores 86% accuracy
+while being operationally worthless.
+
+### Stage 5 — Deployment
+
+The winning model is exported and served as a local analytics API. Three
+problems had to be solved to get from "a trained model in a script" to "a
+model an API can serve":
+
+**1. The preprocessor and the models were fitted separately.** Section 7 fits
+the `ColumnTransformer` on its own, and every estimator is then fitted on an
+already-encoded matrix. Pickling an estimator alone would produce something
+that only accepts a ~200-column encoded array — useless to an endpoint
+receiving JSON. Both fitted objects are therefore wrapped into a single
+`Pipeline`, which accepts raw feature rows. Neither component is refitted:
+sklearn only refits on `.fit()`, so the deployed model is exactly the evaluated
+one.
+
+**2. Rare-category grouping is data-dependent.** Feature engineering folds
+categories below 1% frequency into `"Other"` using frequencies computed across
+the whole training set. A single incoming API row has no frequency
+distribution, so recomputing would group nothing — a category that trained as
+`"Other"` would arrive raw and be silently one-hot encoded as all-zeros,
+producing a wrong prediction with no error raised. The surviving category lists
+are captured at training time, shipped in the bundle, and replayed on every
+request.
+
+**3. The decision threshold.** See below.
+
+Everything the API needs travels in **one pickle** (`model_bundle.pkl`) — the
+pipeline, the threshold, the feature order, the rare-category maps, the form
+schema, and the metrics — so the served model and the metadata describing it
+cannot drift apart.
+
+#### Choosing the decision threshold
+
+The default 0.5 cut-off is arbitrary here. The project's whole framing is that
+a **false negative — a fatal collision predicted non-fatal — is the expensive
+error**, so the deployed API should not inherit a threshold that treats both
+error types as equally costly.
+
+The obvious fix — maximising F-beta with beta=2 to weight recall more heavily —
+is a **poor criterion on this dataset**. Precision on the Fatal class is bounded
+below by the class prevalence (~15%), while recall can always be driven toward
+1.0 by lowering the threshold, so F2 rewards ever-lower cut-offs. Its optimum
+falls below 0.01, off the bottom of the searched range, and scores 0.505 against
+**0.474 for a classifier that simply labels every record Fatal**. That narrow
+margin is the problem: most of F2's score at its optimum comes from the same
+indiscriminate direction as the all-positive baseline rather than from genuine
+discrimination. The script computes the all-positive baseline explicitly and
+prints the comparison rather than asserting the conclusion.
+
+**Youden's J** (`TPR − FPR`) is used instead. It cannot degenerate — J = 0 for
+both all-positive and all-negative predictions, so its maximum is necessarily
+an interior, genuinely discriminating point. It is also the standard cut-point
+criterion for the ROC curve already plotted in Stage 4, and it is
+prevalence-independent, which matters because the model was fitted on
+SMOTE-balanced data but scores naturally imbalanced rows.
+
+J is maximised using `roc_curve()`, which evaluates **every distinct predicted
+probability** as a candidate cut-point, rather than a fixed grid. This matters
+for the same reason F2 was rejected: a grid can only report an optimum at one
+of its own points, so a maximum sitting near the edge is indistinguishable from
+one the grid is simply too coarse to resolve. The exact search removes grid
+resolution as a factor. `8_threshold_selection.png` plots how every criterion
+behaves across the threshold range, including the all-positive F2 reference
+line that makes the degeneracy visible.
+
+Critically, the threshold is tuned on a **validation split carved out of the
+training data, never on the test set**. `X_train` is split again by `ACCNUM`, a
+clone of the winning estimator is refitted on the sub-training half, and the
+threshold is selected on the held-out validation half at its natural class
+balance. Choosing a cut-off that maximises a score on the test set and then
+reporting that same score would be leakage; because the test set played no part
+in the selection, the reported figures remain an honest held-out estimate.
+
+#### Deployment results
+
+The **neural network (MLP)** is deployed. It had both the highest test F1
+(0.340) and the highest ROC-AUC (0.736) — the latter matters most here, because
+ROC-AUC is threshold-independent, so the best-ranking model stays the right
+choice after the cut-off is retuned.
+
+Selected threshold: **0.0160** (validation J = 0.346, chosen from 742 candidate
+cut-points).
+
+Test-set performance, on data untouched by both training and threshold
+selection:
+
+| Threshold | Accuracy | Precision | Recall | F1 | F2 |
+|-----------|----------|-----------|--------|-------|-------|
+| 0.50 (sklearn default) | 82.4% | 35.4% | 32.7% | 0.340 | 0.332 |
+| **0.0160 (deployed)** | 76.2% | 30.0% | **53.7%** | **0.385** | **0.464** |
+
+Retuning the threshold **catches 104 more fatalities** on the test set
+(missed fatalities fall from 333 to 229) at the cost of 325 additional false
+alarms (296 → 621). Accuracy drops by 6 points, which is the expected and
+accepted trade: for a tool that flags collision records for human review, a
+false alarm costs a review while a missed fatality costs the outcome the model
+exists to surface. F1 improves as well, so the gain in recall is not simply
+bought at a proportional loss elsewhere.
+
+Confusion matrix at the deployed threshold:
+
+|  | Predicted Non-Fatal | Predicted Fatal |
+|--|--------------------|-----------------|
+| **Actual Non-Fatal** | 2459 | 621 |
+| **Actual Fatal** | 229 | 266 |
+
 ## 7. Requirements
 
-```
-pandas
-numpy
-matplotlib
-seaborn
-scikit-learn
-imbalanced-learn
+```bash
+pip install -r requirements.txt
 ```
 
-Install dependencies:
-```bash
-pip install pandas numpy matplotlib seaborn scikit-learn imbalanced-learn
-```
+`scikit-learn` is **pinned to an exact version**. A pickled estimator is not
+portable across scikit-learn versions — loading `model_bundle.pkl` under a
+different version either warns and misbehaves or fails outright, so the API
+must run on the same version that trained the model.
 
 ## 8. Usage
+
+> For deployment specifically, **[DELIVERABLE_5_GUIDE.md](DELIVERABLE_5_GUIDE.md)**
+> is the step-by-step walkthrough: what to run, what every part of the interface
+> means, how to read the client output, and the design decisions behind the
+> deployed threshold.
+
+### Step 1 — Train the models and export the deployable bundle
 
 ```bash
 python public_safety_ml.py
 ```
 
-Running the script will:
-1. Print exploration and missing-value diagnostics to the console.
-2. Generate and save the five visualization PNGs listed above.
-3. Print the full modelling pipeline output — feature selection reasoning, crash-grouped train/test split summary, and class-balance verification.
+This runs the entire pipeline end to end and:
+1. Prints exploration and missing-value diagnostics.
+2. Saves the eight visualization PNGs.
+3. Trains and tunes all five algorithms, printing the comparison table.
+4. Writes `model_bundle.pkl`, `test_samples.csv`, and `model_metadata.json`.
 
-## 9. Course
+Both the fitted preprocessor and the fitted models must be in memory at export
+time, so the export runs at the end of a **single full training run** — it is
+not a separate script. Expect several minutes, dominated by the hyperparameter
+searches.
+
+### Step 2 — Start the API
+
+```bash
+python app.py
+```
+
+Serves on `http://127.0.0.1:5000`. The bundle is unpickled once at start-up.
+
+### Step 3 — Test it
+
+**Browser** — open `http://127.0.0.1:5000`, pick a record from the
+*held-out test record* dropdown to fill the form, and submit. The page shows
+the predicted class, the fatality probability against the decision threshold,
+and the record's recorded outcome for comparison.
+
+**Python client** — with the API running, in a second terminal:
+
+```bash
+python client.py
+```
+
+Runs six checks against held-out data: health, schema retrieval, a single
+prediction, a 25-record batch with a confusion breakdown, a partial-input
+request, and four error cases.
+
+**Postman** — import `postman_collection.json`
+(*File → Import*). Eight requests, each with test assertions, runnable
+via the Collection Runner. Regenerate after retraining with
+`python make_postman_collection.py`.
+
+**curl**:
+
+```bash
+curl http://127.0.0.1:5000/health
+curl -X POST http://127.0.0.1:5000/predict \
+     -H "Content-Type: application/json" \
+     -d '{"INVTYPE": "Pedestrian", "SPEEDING": 1, "ALCOHOL": 0, "LIGHT": "Dark"}'
+```
+
+## 9. API Reference
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `GET`  | `/` | Browser client — HTML form covering every model feature |
+| `POST` | `/predict-form` | Form submission; re-renders the page with the result |
+| `POST` | `/predict` | JSON in, JSON out — the main analytics endpoint |
+| `POST` | `/predict/batch` | Scores a list of records in one request |
+| `GET`  | `/schema` | Every accepted field, with valid options and ranges |
+| `GET`  | `/samples` | Held-out test records with their recorded outcomes |
+| `GET`  | `/health` | Liveness, loaded model, threshold, and test metrics |
+
+### Request
+
+`POST /predict` accepts a JSON object of feature values. Field names are
+case-insensitive.
+
+```json
+{
+  "INVTYPE": "Pedestrian",
+  "SPEEDING": 1,
+  "ALCOHOL": 0,
+  "LIGHT": "Dark",
+  "LATITUDE": 43.7,
+  "LONGITUDE": -79.4
+}
+```
+
+Three conveniences are built in, each mirroring a training-time transformation:
+
+- **Partial bodies are accepted.** Any field not supplied is filled with the
+  training-set default, and every substitution is listed in `warnings` — the
+  API never silently invents input.
+- **`TIME` is accepted in place of `HOUR`** (e.g. `1430` → hour 14), matching
+  the `TIME // 100` feature engineering.
+- **Binary flags accept `1`/`0`, `"Yes"`/`"No"`, or `true`/`false`**, all
+  normalised to the 0/1 the model was trained on.
+
+### Response
+
+```json
+{
+  "prediction": 1,
+  "label": "Fatal",
+  "probability_fatal": 0.8123,
+  "probability_non_fatal": 0.1877,
+  "threshold": 0.11,
+  "model": "Neural Network",
+  "warnings": ["..."]
+}
+```
+
+`prediction` applies the deployed threshold to `probability_fatal` — it is not
+sklearn's default 0.5 `.predict()` output.
+
+### Errors
+
+Invalid input returns HTTP 400 with an explanatory `error` string rather than a
+stack trace or a silent guess. Values outside the training range, and
+categories never seen during training, are accepted but flagged in `warnings`,
+since the model can still score them — the caller is told the prediction is an
+extrapolation.
+
+## 10. Limitations
+
+- **Person-level, not crash-level.** Each row in the dataset is one person
+  involved in a collision, and features like `INVTYPE` and `INVAGE` describe
+  that person. The API therefore predicts whether *a given involved person* is
+  likely to be killed, not whether a collision as a whole will be fatal.
+- **Screening aid, not a verdict.** Precision on the Fatal class is modest, so
+  a substantial share of flagged records will not be fatal. The threshold was
+  chosen deliberately to trade precision for recall — appropriate for
+  prioritising records for review, not for any automated decision about an
+  individual.
+- **Probabilities are poorly calibrated.** The MLP's outputs cluster near 0 and
+  1, so `probability_fatal` should be read as a ranking score rather than a
+  literal likelihood.
+- **Historical scope.** The model reflects 2006–2022 Toronto KSI reporting
+  practice and does not account for subsequent road or policy changes.
+
+## 11. Course
 
 **COMP247 — Supervised Learning**
 Centennial College — Semester 4
