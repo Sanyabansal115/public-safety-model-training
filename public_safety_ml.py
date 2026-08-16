@@ -4,8 +4,10 @@ import seaborn as sns
 from sklearn.model_selection import GroupShuffleSplit
 
 
-df = pd.read_csv("KSI_data.csv")
+
+df = pd.read_csv('C:/Users/2000d/OneDrive/Desktop/Summer 2026/Supervised Learning/KSI_data.csv')
 print(df.head())
+
 
 print(df.shape)
 
@@ -498,16 +500,6 @@ categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
 print(f"Numeric features ({len(numeric_features)}): {numeric_features}")
 print(f"Categorical features ({len(categorical_features)}): {categorical_features}")
 
-# Extract crash-level groups BEFORE dropping ACCNUM from X
-groups = X["ACCNUM"]
-
-# Now drop ACCNUM from X — it's not a predictive feature
-X = X.drop(columns=["ACCNUM"])
-
-# Re-identify column types AFTER dropping ACCNUM
-numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
-categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
-
 # Split by crash ID — whole crashes stay together in train OR test, never split
 # across both. GroupShuffleSplit does NOT stratify by y — it only respects
 # groups — so the Fatal ratio below is a result, not a guarantee.
@@ -631,4 +623,343 @@ print(f"""
     numeric     -> SimpleImputer(median) -> StandardScaler
     categorical -> SimpleImputer(mode)   -> OneHotEncoder
   )
+""")
+
+
+# =============================================================================
+# DELIVERABLE 3 — PREDICTIVE MODEL BUILDING
+# =============================================================================
+# Picks up exactly where Deliverable 2 left off: X_train_resampled /
+# y_train_resampled (SMOTE-balanced, encoded+scaled) for fitting, and
+# X_test_processed / y_test (untouched, real-world imbalance) for evaluation.
+# Test data is NEVER resampled — that would make the evaluation dishonest.
+
+import time
+from scipy.stats import randint, uniform
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import (
+    GridSearchCV,
+    RandomizedSearchCV,
+    StratifiedKFold,
+)
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    roc_curve,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
+
+RANDOM_STATE = 42
+
+# Public-safety framing: a false negative (predicting Non-Fatal when the
+# collision was actually Fatal) is the costly error, so RECALL on the Fatal
+# class matters at least as much as raw accuracy. Every model below is scored
+# on F1 during tuning (balances precision/recall) and Recall is reported
+# explicitly for every model at evaluation time so that trade-off is visible,
+# not hidden behind an accuracy number that the class imbalance would inflate.
+
+cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+
+def evaluate_model(name, model, X_test, y_test, results_list):
+    """Fit-agnostic evaluation: assumes `model` is already fitted."""
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    auc = roc_auc_score(y_test, y_proba) if y_proba is not None else np.nan
+
+    print(f"\n--- {name} ---")
+    print(classification_report(y_test, y_pred, target_names=["Non-Fatal", "Fatal"], zero_division=0))
+    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+    print(f"Accuracy={acc:.3f}  Precision={prec:.3f}  Recall={rec:.3f}  F1={f1:.3f}  ROC-AUC={auc:.3f}")
+
+    results_list.append({
+        "Model": name, "Accuracy": acc, "Precision": prec,
+        "Recall": rec, "F1": f1, "ROC-AUC": auc,
+        "y_proba": y_proba,
+    })
+    return results_list
+
+
+results = []
+tuned_models = {}
+
+# -----------------------------------------------------------------------
+# 9.1 LOGISTIC REGRESSION — GridSearchCV
+# -----------------------------------------------------------------------
+# Small, cheap parameter space -> exhaustive grid search is affordable and
+# gives the exact optimum over this grid (no sampling variance).
+print("\n9.1 LOGISTIC REGRESSION — GRID SEARCH")
+
+log_reg_param_grid = {
+    "C": [0.01, 0.1, 1, 10, 100],
+    "penalty": ["l1", "l2"],
+    "solver": ["liblinear"],  # only solver that supports both l1 and l2 here
+}
+
+log_reg_grid = GridSearchCV(
+    LogisticRegression(max_iter=2000, random_state=RANDOM_STATE),
+    param_grid=log_reg_param_grid,
+    scoring="f1",
+    cv=cv_strategy,
+    n_jobs=-1,
+    verbose=1,
+)
+
+t0 = time.time()
+log_reg_grid.fit(X_train_resampled, y_train_resampled)
+print(f"  Fit time: {time.time() - t0:.1f}s")
+print(f"  Best params: {log_reg_grid.best_params_}")
+print(f"  Best CV F1: {log_reg_grid.best_score_:.3f}")
+
+tuned_models["Logistic Regression"] = log_reg_grid.best_estimator_
+results = evaluate_model("Logistic Regression (tuned)", log_reg_grid.best_estimator_,
+                          X_test_processed, y_test, results)
+
+# -----------------------------------------------------------------------
+# 9.2 DECISION TREE — GridSearchCV
+# -----------------------------------------------------------------------
+# Still a small enough space (5*3*3*2 = 90 combos * 5 folds) for a full grid.
+print("\n9.2 DECISION TREE — GRID SEARCH")
+
+dt_param_grid = {
+    "max_depth": [5, 10, 15, 20, None],
+    "min_samples_split": [2, 5, 10],
+    "min_samples_leaf": [1, 2, 4],
+    "criterion": ["gini", "entropy"],
+}
+
+dt_grid = GridSearchCV(
+    DecisionTreeClassifier(random_state=RANDOM_STATE),
+    param_grid=dt_param_grid,
+    scoring="f1",
+    cv=cv_strategy,
+    n_jobs=-1,
+    verbose=1,
+)
+
+t0 = time.time()
+dt_grid.fit(X_train_resampled, y_train_resampled)
+print(f"  Fit time: {time.time() - t0:.1f}s")
+print(f"  Best params: {dt_grid.best_params_}")
+print(f"  Best CV F1: {dt_grid.best_score_:.3f}")
+
+tuned_models["Decision Tree"] = dt_grid.best_estimator_
+results = evaluate_model("Decision Tree (tuned)", dt_grid.best_estimator_,
+                          X_test_processed, y_test, results)
+
+# -----------------------------------------------------------------------
+# 9.3 SUPPORT VECTOR MACHINE — RandomizedSearchCV
+# -----------------------------------------------------------------------
+# SVC training cost scales roughly quadratically-to-cubically with sample
+# count, and the SMOTE-resampled training set can run into the tens of
+# thousands of rows. A full grid search here is impractical, so
+# RandomizedSearchCV samples a fixed number of parameter combinations
+# instead of trying all of them. SVM is also fit on a stratified subsample
+# of the resampled training data (capped, and capped LOWER than the other
+# models here) purely for tractability -- this is a runtime concession, not
+# a data-quality one, and is called out explicitly rather than silently
+# changing the training set.
+#
+# Three further runtime cuts vs. the other models' searches, all specific
+# to SVM's cost profile:
+#   - CAP dropped to 4000 rows (was 15000) -- SVC training time grows much
+#     faster than linearly, so this is the single biggest lever.
+#   - kernel fixed to "rbf" only -- SVC's own "linear" kernel implementation
+#     is far slower than the dedicated LinearSVC class at this row count,
+#     so it's dropped here rather than paying for a slow linear fit.
+#   - a dedicated 3-fold CV (svm_cv) instead of the 5-fold used elsewhere,
+#     and n_iter cut from 15 to 8 -- fewer, cheaper fits (24 total vs. 75).
+print("\n9.3 SUPPORT VECTOR MACHINE — RANDOMIZED SEARCH")
+
+SVM_SAMPLE_CAP = 4000
+if X_train_resampled.shape[0] > SVM_SAMPLE_CAP:
+    rng = np.random.RandomState(RANDOM_STATE)
+    sample_idx = rng.choice(X_train_resampled.shape[0], size=SVM_SAMPLE_CAP, replace=False)
+    X_train_svm = X_train_resampled[sample_idx]
+    y_train_svm = y_train_resampled.iloc[sample_idx] if hasattr(y_train_resampled, "iloc") else y_train_resampled[sample_idx]
+    print(f"  Subsampled SVM training set: {SVM_SAMPLE_CAP} of {X_train_resampled.shape[0]} rows")
+else:
+    X_train_svm, y_train_svm = X_train_resampled, y_train_resampled
+
+svm_param_dist = {
+    "C": uniform(0.1, 20),
+    "kernel": ["rbf"],
+    "gamma": ["scale", "auto"],
+}
+
+svm_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+
+svm_random = RandomizedSearchCV(
+    SVC(probability=True, random_state=RANDOM_STATE, cache_size=1000),
+    param_distributions=svm_param_dist,
+    n_iter=8,
+    scoring="f1",
+    cv=svm_cv,
+    n_jobs=-1,
+    random_state=RANDOM_STATE,
+    verbose=1,
+)
+
+t0 = time.time()
+svm_random.fit(X_train_svm, y_train_svm)
+print(f"  Fit time: {time.time() - t0:.1f}s")
+print(f"  Best params: {svm_random.best_params_}")
+print(f"  Best CV F1: {svm_random.best_score_:.3f}")
+
+tuned_models["SVM"] = svm_random.best_estimator_
+results = evaluate_model("SVM (tuned)", svm_random.best_estimator_,
+                          X_test_processed, y_test, results)
+
+# -----------------------------------------------------------------------
+# 9.4 RANDOM FOREST — RandomizedSearchCV
+# -----------------------------------------------------------------------
+# Ensemble with several interacting hyperparameters -> a full grid would be
+# huge, so RandomizedSearchCV explores a wide distribution with a fixed
+# sampling budget.
+print("\n9.4 RANDOM FOREST — RANDOMIZED SEARCH")
+
+rf_param_dist = {
+    "n_estimators": randint(100, 500),
+    "max_depth": [10, 20, 30, None],
+    "min_samples_split": randint(2, 10),
+    "min_samples_leaf": randint(1, 5),
+    "max_features": ["sqrt", "log2"],
+}
+
+rf_random = RandomizedSearchCV(
+    RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
+    param_distributions=rf_param_dist,
+    n_iter=20,
+    scoring="f1",
+    cv=cv_strategy,
+    n_jobs=-1,
+    random_state=RANDOM_STATE,
+    verbose=1,
+)
+
+t0 = time.time()
+rf_random.fit(X_train_resampled, y_train_resampled)
+print(f"  Fit time: {time.time() - t0:.1f}s")
+print(f"  Best params: {rf_random.best_params_}")
+print(f"  Best CV F1: {rf_random.best_score_:.3f}")
+
+tuned_models["Random Forest"] = rf_random.best_estimator_
+results = evaluate_model("Random Forest (tuned)", rf_random.best_estimator_,
+                          X_test_processed, y_test, results)
+
+# -----------------------------------------------------------------------
+# 9.5 NEURAL NETWORK (MLPClassifier) — RandomizedSearchCV
+# -----------------------------------------------------------------------
+print("\n9.5 NEURAL NETWORK (MLP) — RANDOMIZED SEARCH")
+
+mlp_param_dist = {
+    "hidden_layer_sizes": [(50,), (100,), (50, 50), (100, 50), (100, 100)],
+    "activation": ["relu", "tanh"],
+    "alpha": [0.0001, 0.001, 0.01],
+    "learning_rate_init": [0.001, 0.01],
+}
+
+mlp_random = RandomizedSearchCV(
+    MLPClassifier(max_iter=300, early_stopping=True, random_state=RANDOM_STATE),
+    param_distributions=mlp_param_dist,
+    n_iter=15,
+    scoring="f1",
+    cv=cv_strategy,
+    n_jobs=-1,
+    random_state=RANDOM_STATE,
+    verbose=1,
+)
+
+t0 = time.time()
+mlp_random.fit(X_train_resampled, y_train_resampled)
+print(f"  Fit time: {time.time() - t0:.1f}s")
+print(f"  Best params: {mlp_random.best_params_}")
+print(f"  Best CV F1: {mlp_random.best_score_:.3f}")
+
+tuned_models["Neural Network"] = mlp_random.best_estimator_
+results = evaluate_model("Neural Network (tuned)", mlp_random.best_estimator_,
+                          X_test_processed, y_test, results)
+
+
+# -----------------------------------------------------------------------
+# 9.6 MODEL COMPARISON
+# -----------------------------------------------------------------------
+print("\n9.6 MODEL COMPARISON")
+
+results_df = pd.DataFrame(results).drop(columns=["y_proba"])
+results_df = results_df.sort_values("F1", ascending=False).reset_index(drop=True)
+print(results_df.to_string(index=False))
+
+best_model_name = results_df.iloc[0]["Model"]
+print(f"\n  Best model by F1 (Fatal class): {best_model_name}")
+
+# -----------------------------------------------------------------------
+# 9.7 ROC CURVES — all tuned models overlaid
+# -----------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(8, 7))
+for r in results:
+    if r["y_proba"] is not None:
+        fpr, tpr, _ = roc_curve(y_test, r["y_proba"])
+        ax.plot(fpr, tpr, label=f"{r['Model']} (AUC={r['ROC-AUC']:.3f})")
+ax.plot([0, 1], [0, 1], linestyle="--", color="grey", label="Chance")
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.set_title("ROC Curves — Tuned Models")
+ax.legend(loc="lower right", fontsize=8)
+plt.tight_layout()
+plt.savefig("6_roc_curves_all_models.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# -----------------------------------------------------------------------
+# 9.8 FEATURE IMPORTANCE — Random Forest (interpretable, tree-based)
+# -----------------------------------------------------------------------
+rf_best = tuned_models["Random Forest"]
+importances = pd.Series(rf_best.feature_importances_, index=all_feature_names)
+top_importances = importances.sort_values(ascending=False).head(20).sort_values()
+
+fig, ax = plt.subplots(figsize=(9, 8))
+top_importances.plot(kind="barh", ax=ax, color="#4c72b0")
+ax.set_title("Top 20 Feature Importances — Random Forest")
+ax.set_xlabel("Importance")
+plt.tight_layout()
+plt.savefig("7_feature_importance_rf.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+# SUMMARY
+print("\nDELIVERABLE 3 — SUMMARY")
+print(f"""
+  Models trained & tuned: Logistic Regression, Decision Tree, SVM,
+    Random Forest, Neural Network (MLPClassifier)
+
+  Tuning method:
+    GridSearchCV       -> Logistic Regression, Decision Tree (small, cheap
+                           search spaces -> exhaustive search is affordable)
+    RandomizedSearchCV -> SVM, Random Forest, Neural Network (large search
+                           spaces / expensive fits -> fixed sampling budget)
+
+  Scoring metric for tuning: F1 on the Fatal class (accuracy would be
+    misleadingly high given the class imbalance; F1 balances catching Fatal
+    cases against false alarms)
+
+  All models fit on SMOTE-resampled training data, evaluated on the
+    untouched, naturally-imbalanced test set.
+
+  Best model by test F1: {best_model_name}
+
+{results_df.to_string(index=False)}
 """)
