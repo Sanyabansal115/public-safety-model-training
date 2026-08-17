@@ -141,13 +141,22 @@
     <p class="blurb">
       These rows come from the test split and were never used to train the model.
       Selecting one fills in every field below, so you can compare the prediction
-      against the recorded outcome.
+      against the recorded outcome. Choosing a record only fills the form — it
+      does not change the model, the threshold, or the prediction logic.
+    </p>
+    <p class="blurb">
+      <b>Note on this sample:</b> these {{ samples|length }} records are
+      deliberately enriched with fatal cases so both classes can be demonstrated.
+      They are not representative of the real ~14% fatality rate, so accuracy
+      measured across this dropdown will look worse than the model's actual
+      performance. The honest held-out figures are in the
+      <b>Deployed model</b> panel at the bottom of this page.
     </p>
     <div class="actions">
       <select id="sample-picker" style="max-width: 420px">
         <option value="">— choose a held-out record —</option>
         {% for s in samples %}
-        <option value="{{ s.id }}">Record #{{ s.id }} — actual outcome: {{ s.actual_label }}</option>
+        <option value="{{ s.id }}">Record #{{ s.id }}</option>
         {% endfor %}
       </select>
       <span id="sample-actual" class="badge" style="display:none"></span>

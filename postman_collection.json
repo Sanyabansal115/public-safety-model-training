@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "KSI Collision Fatality API",
-    "description": "Deliverable 5 \u2014 client tests for the Flask analytics API serving the Neural Network model at threshold 0.0160.\n\nStart the API with `python app.py`, then run this collection.\n\nThe /predict bodies are real held-out test records that were never used to train the model; each request's description gives the recorded outcome so the prediction can be checked against it.",
+    "description": "Deliverable 5 \u2014 client tests for the Flask analytics API serving the Neural Network (calibrated) model at threshold 0.0197.\n\nStart the API with `python app.py`, then run this collection.\n\nThe /predict bodies are real held-out test records that were never used to train the model; each request's description gives the recorded outcome so the prediction can be checked against it.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [

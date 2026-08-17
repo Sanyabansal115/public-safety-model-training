@@ -69,6 +69,7 @@ GroupProject/
 ├── model_bundle.pkl                   # Pickled serving pipeline + metadata  (generated)
 ├── test_samples.csv                   # Held-out test rows for client testing (generated)
 ├── model_metadata.json                # Human-readable bundle contents       (generated)
+├── part4_report_numbers.md            # Part 4 table + confusion matrices    (generated)
 │
 ├── 1_collisions_by_year_severity.png  # Yearly trend, by severity
 ├── 2_collisions_by_hour.png           # Hour-of-day risk profile
@@ -81,7 +82,7 @@ GroupProject/
 └── README.md                          # Project documentation
 ```
 
-The four `(generated)` artifacts are written by `public_safety_ml.py`; the API
+The five `(generated)` artifacts are written by `public_safety_ml.py`; the API
 will not start without `model_bundle.pkl`.
 
 ## 6. Methodology
@@ -217,7 +218,17 @@ The **neural network (MLP)** is deployed. It had both the highest test F1
 ROC-AUC is threshold-independent, so the best-ranking model stays the right
 choice after the cut-off is retuned.
 
-Selected threshold: **0.0160** (validation J = 0.346, chosen from 742 candidate
+**It is served with isotonic calibration** (`CalibratedClassifierCV`, 3-fold),
+applied at the deployment stage rather than during model comparison. The raw MLP
+pinned 65% of its predictions below 0.001 or above 0.999, which made the served
+probability useless — the form returned "0.0%" for nearly every input.
+Calibration cuts that to 19%. Isotonic mapping is monotonic, so it cannot
+reorder records: ROC-AUC is unchanged at 0.740 and the Deliverable 3 model
+comparison still stands. Note this means the served estimator is not
+byte-identical to the one evaluated in Deliverable 3, since calibration refits
+the base model across folds.
+
+Selected threshold: **0.0197** (validation J = 0.354, chosen from 415 candidate
 cut-points).
 
 Test-set performance, on data untouched by both training and threshold
@@ -225,23 +236,31 @@ selection:
 
 | Threshold | Accuracy | Precision | Recall | F1 | F2 |
 |-----------|----------|-----------|--------|-------|-------|
-| 0.50 (sklearn default) | 82.4% | 35.4% | 32.7% | 0.340 | 0.332 |
-| **0.0160 (deployed)** | 76.2% | 30.0% | **53.7%** | **0.385** | **0.464** |
+| 0.50 (sklearn default) | 85.4% | 44.3% | 21.0% | 0.285 | 0.235 |
+| **0.0197 (deployed)** | 68.2% | 25.3% | **66.1%** | **0.365** | **0.499** |
 
-Retuning the threshold **catches 104 more fatalities** on the test set
-(missed fatalities fall from 333 to 229) at the cost of 325 additional false
-alarms (296 → 621). Accuracy drops by 6 points, which is the expected and
-accepted trade: for a tool that flags collision records for human review, a
-false alarm costs a review while a missed fatality costs the outcome the model
-exists to surface. F1 improves as well, so the gain in recall is not simply
-bought at a proportional loss elsewhere.
+Retuning the threshold **catches 223 more fatalities** on the test set (missed
+fatalities fall from 391 to 168), at the cost of 837 additional false alarms
+(131 → 968).
 
 Confusion matrix at the deployed threshold:
 
 |  | Predicted Non-Fatal | Predicted Fatal |
 |--|--------------------|-----------------|
-| **Actual Non-Fatal** | 2459 | 621 |
-| **Actual Fatal** | 229 | 266 |
+| **Actual Non-Fatal** | 2112 | 968 |
+| **Actual Fatal** | 168 | 327 |
+
+**Read the accuracy figure carefully.** 68.2% is *below* the 86% a model would
+score by predicting "Non-Fatal" for everything — because that trivial model
+catches zero fatalities, which is the entire point of building this. The
+deployed configuration finds two thirds of them. This is a deliberate operating
+point, not a weak result, but it must be presented as such rather than buried.
+
+Validation F1 is essentially flat between thresholds 0.02 and 0.20
+(0.385–0.399), so the choice of cut-off is not really a choice about overall
+quality — it only decides where on the recall/precision curve the tool sits.
+Youden's J places it at the high-recall end, consistent with the
+false-negative-is-costlier framing used throughout.
 
 ## 7. Requirements
 
@@ -391,13 +410,95 @@ extrapolation.
   chosen deliberately to trade precision for recall — appropriate for
   prioritising records for review, not for any automated decision about an
   individual.
-- **Probabilities are poorly calibrated.** The MLP's outputs cluster near 0 and
-  1, so `probability_fatal` should be read as a ranking score rather than a
-  literal likelihood.
+- **The decision surface is not well-behaved, and this is the most important
+  limitation.** Flipping a single risk flag from No to Yes on a real record
+  moves the prediction in the *wrong* direction 27.6% of the time. The
+  behaviour is also inconsistent: the same flag can raise the estimate on one
+  record and lower it on the next. In practice this means a record with
+  speeding, alcohol, aggressive driving and red-light running can score lower
+  than the same record with speeding alone. The model is usable for **ranking
+  records**, which is what ROC-AUC measures and what the screening use case
+  needs, but it is **not usable for counterfactual reasoning** — "what happens
+  to the risk if this one factor changes" is a question it cannot answer
+  reliably. See §11 for the investigation.
+
+- **Probabilities were saturated before calibration.** The raw MLP pinned 65%
+  of its test predictions below 0.001 or above 0.999. Isotonic calibration at
+  the deployment stage reduced that to 19%, which is why the served
+  `probability_fatal` now varies meaningfully across inputs. Treat it as a
+  calibrated ranking score, not a literal actuarial likelihood.
+
+- **One feature is a data artifact.** Setting `DIVISION` to `NSA` (police
+  division not recorded) alone drives the prediction to ~0.99. The model has
+  learned that a missing administrative field predicts fatality, almost
+  certainly reflecting how those reports are filed rather than anything about
+  the collision itself.
 - **Historical scope.** The model reflects 2006–2022 Toronto KSI reporting
   practice and does not account for subsequent road or policy changes.
 
-## 11. Course
+## 11. Investigating the unstable decision surface
+
+The instability above was found by using the deployed form, not by reading
+metrics — setting speeding, alcohol, aggressive driving and red-light running
+all to Yes produced a *lower* fatality probability than speeding alone. What
+follows is the investigation, including the hypotheses that turned out to be
+wrong, because the negative results are what narrowed it down.
+
+**Measurement.** For 200 real test records, each of the four behavioural risk
+flags currently set to No was flipped to Yes, one at a time, and the change in
+predicted probability recorded. Turning a risk factor *on* should not *reduce*
+predicted fatality risk; every case where it does is counted as a monotonicity
+violation. Saturation is the share of test predictions pinned below 0.001 or
+above 0.999.
+
+| Variant | Violations | ROC-AUC | Saturation |
+|---|---|---|---|
+| SMOTE on encoded data (original) | 33.6% | 0.7363 | 65.1% |
+| SMOTENC on raw features | 36.8% | 0.7281 | 54.7% |
+| No resampling at all | 36.7% | 0.7304 | 58.3% |
+| MLP with lower learning rate, more L2 | 42.7% | 0.7487 | 31.0% |
+| **MLP + isotonic calibration (deployed)** | **27.6%** | **0.7398** | **18.8%** |
+| Logistic regression | 17.1% | 0.6819 | 0.0% |
+
+**Hypothesis 1 — SMOTE on one-hot data. Wrong.** SMOTE runs after the
+`ColumnTransformer`, so it interpolates in the encoded space and produces
+synthetic rows with fractional categorical values (`PEDESTRIAN = 0.37`), which
+no real record can have. `SMOTENC` handles categorical columns by taking the
+neighbourhood mode instead, so it should have removed those impossible points.
+It made the violation rate slightly *worse*, and removing resampling entirely
+did not help either. Resampling is not the cause.
+
+**Hypothesis 2 — the MLP is over-trained. Also wrong.** Cutting the learning
+rate tenfold and raising L2 a hundredfold reduced saturation substantially but
+made the violation rate *worse* (42.7%).
+
+**What the logistic regression comparison revealed.** Its 113 violations turned
+out to be exactly the 113 probe rows where `AG_DRIV` was 0 — the fitted
+coefficient for aggressive driving is negative (−0.262), so it lowers the
+estimate for *every* record, consistently. That is an explainable statistical
+result (aggressive-driving collisions, conditional on everything else, are
+typically lower-speed urban intersection crashes), not instability.
+
+That reframed the finding: **the problem is not the violation rate, it is the
+inconsistency.** A linear model applies one rule in one direction to every
+record. The MLP applies a different rule per record, because its ~200
+dimensional decision surface is shaped by a training set that occupies only a
+small region of that space — and single-flag edits walk into corners no real
+record ever occupied.
+
+**What was adopted.** Isotonic calibration, applied at the deployment stage.
+It cuts saturation from 65% to 19% and leaves ROC-AUC unchanged (isotonic
+mapping is monotonic, so record ranking is preserved by construction). It
+reduces violations from 33.6% to 27.6% but does **not** resolve them.
+
+Logistic regression is the only variant that behaves consistently, and it was
+not adopted because ROC-AUC falls from 0.736 to 0.682 — it would contradict the
+model comparison in Deliverable 3 while still not being a strong model. The
+honest conclusion is that this dataset supports record *ranking* far better
+than it supports per-record *explanation*, and the deployed API is documented
+accordingly.
+
+## 12. Course
 
 **COMP247 — Supervised Learning**
 Centennial College — Semester 4

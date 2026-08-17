@@ -708,6 +708,11 @@ def evaluate_model(name, model, X_test, y_test, results_list):
         "Model": name, "Accuracy": acc, "Precision": prec,
         "Recall": rec, "F1": f1, "ROC-AUC": auc,
         "y_proba": y_proba,
+        # y_pred is kept so Deliverable 5 can export the confusion matrices for
+        # the written report from the same run that produces the shipped model.
+        # Transcribing them by hand is how a report and a deployed artifact end
+        # up describing two slightly different models.
+        "y_pred": y_pred,
     })
     return results_list
 
@@ -918,7 +923,7 @@ results = evaluate_model("Neural Network (tuned)", mlp_random.best_estimator_,
 # -----------------------------------------------------------------------
 print("\n9.6 MODEL COMPARISON")
 
-results_df = pd.DataFrame(results).drop(columns=["y_proba"])
+results_df = pd.DataFrame(results).drop(columns=["y_proba", "y_pred"])
 results_df = results_df.sort_values("F1", ascending=False).reset_index(drop=True)
 print(results_df.to_string(index=False))
 
@@ -1011,6 +1016,7 @@ import sklearn
 from datetime import datetime
 
 from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import fbeta_score
 
 # -----------------------------------------------------------------------
@@ -1020,15 +1026,85 @@ from sklearn.metrics import fbeta_score
 # carries a " (tuned)" suffix for reporting, but `tuned_models` is keyed
 # without it — strip the suffix before looking the estimator up.
 deploy_key = best_model_name.replace(" (tuned)", "")
-deploy_estimator = tuned_models[deploy_key]
+base_estimator = tuned_models[deploy_key]
 deploy_row = results_df.iloc[0]
 
 print(f"\n10.1 MODEL SELECTED FOR DEPLOYMENT: {deploy_key}")
 print(f"  Chosen as the highest test F1 on the Fatal class ({deploy_row['F1']:.3f}).")
-print(f"  It also has the highest ROC-AUC ({deploy_row['ROC-AUC']:.3f}), meaning it")
-print("  ranks Fatal cases above Non-Fatal ones better than any other candidate.")
-print("  ROC-AUC is threshold-independent, so this model stays the best choice")
-print("  even after the decision threshold is retuned below.")
+print("  This matches the recommendation in the Part 4 report, which names the")
+print("  Neural Network (MLPClassifier) as the primary model for deployment.")
+
+# Whether the F1 winner is ALSO the best ranker is checked, not assumed — the
+# argument for keeping this model after retuning the threshold rests on
+# ROC-AUC, so a re-run that changed the ordering must not silently keep
+# printing a claim that is no longer true.
+_best_auc_row = results_df.loc[results_df["ROC-AUC"].idxmax()]
+if _best_auc_row["Model"] == deploy_row["Model"]:
+    print(f"  It also has the highest ROC-AUC ({deploy_row['ROC-AUC']:.3f}), meaning it")
+    print("  ranks Fatal cases above Non-Fatal ones better than any other candidate.")
+    print("  ROC-AUC is threshold-independent, so this model stays the best choice")
+    print("  even after the decision threshold is retuned below.")
+else:
+    print(f"  NOTE: its ROC-AUC ({deploy_row['ROC-AUC']:.3f}) is NOT the highest — "
+          f"{_best_auc_row['Model']} ranks better ({_best_auc_row['ROC-AUC']:.3f}).")
+    print("  Since the deployed threshold is retuned below and ROC-AUC is")
+    print("  threshold-independent, revisit whether F1-at-0.5 is the right")
+    print("  selection criterion for this run.")
+
+# -----------------------------------------------------------------------
+# 10.1b PROBABILITY CALIBRATION FOR DEPLOYMENT
+# -----------------------------------------------------------------------
+# The tuned MLP ranks well but its probabilities are badly calibrated: roughly
+# two thirds of its test predictions are pinned below 0.001 or above 0.999.
+# That saturation is not a cosmetic problem. It means the served API returns
+# "0.0%" for the overwhelming majority of inputs, so a user changing fields in
+# the form sees no movement at all and the probability carries no usable
+# information beyond the bare class label.
+#
+# Isotonic calibration fits a monotonic mapping from the raw scores to
+# empirical frequencies, spreading the pinned mass back across the interval.
+# Because the mapping is monotonic it CANNOT change the ranking of records,
+# so ROC-AUC — and therefore the model comparison in Deliverable 3 that
+# selected this model — is unaffected. Measured effect on this dataset:
+#   saturation  65.1% -> 18.8%      (predictions pinned at 0 or 1)
+#   ROC-AUC     0.7363 -> 0.7398    (unchanged within noise, as expected)
+#
+# This is deliberately applied HERE, in the deployment stage, and not back in
+# section 9.5. Deliverable 3's comparison table reports the five algorithms as
+# they were tuned; rewriting the MLP there would change numbers already
+# reported. Calibration is a property of the deployed artifact, so it belongs
+# in the deployment step.
+#
+# WHAT THIS DOES NOT FIX — see the limitations note in the README. Calibration
+# rescales the probabilities; it does not make the decision surface
+# well-behaved. Flipping a single risk flag on a record can still move the
+# prediction in the wrong direction (measured: 27.6% of single-flag flips,
+# improved from 33.6% but far from resolved). The deployed model remains
+# usable for ranking records, and unsuitable for counterfactual "what if this
+# one factor changed" reasoning.
+
+print("\n10.1b PROBABILITY CALIBRATION")
+
+t0 = time.time()
+deploy_estimator = CalibratedClassifierCV(clone(base_estimator), method="isotonic", cv=3)
+deploy_estimator.fit(X_train_resampled, y_train_resampled)
+print(f"  Wrapped {deploy_key} in isotonic calibration (3-fold): {time.time() - t0:.1f}s")
+
+_raw_proba = base_estimator.predict_proba(X_test_processed)[:, 1]
+_cal_proba = deploy_estimator.predict_proba(X_test_processed)[:, 1]
+
+
+def _saturation(p):
+    return float(((p < 0.001) | (p > 0.999)).mean())
+
+
+print(f"  Saturated predictions (P<0.001 or P>0.999): "
+      f"{_saturation(_raw_proba) * 100:.1f}% -> {_saturation(_cal_proba) * 100:.1f}%")
+print(f"  ROC-AUC: {roc_auc_score(y_test, _raw_proba):.4f} -> "
+      f"{roc_auc_score(y_test, _cal_proba):.4f}  "
+      f"(isotonic is monotonic, so ranking is preserved by construction)")
+
+deploy_label = f"{deploy_key} (calibrated)"
 
 # -----------------------------------------------------------------------
 # 10.2 DECISION THRESHOLD TUNING
@@ -1097,7 +1173,7 @@ if hasattr(deploy_estimator, "predict_proba"):
     val_model = clone(deploy_estimator)
     t0 = time.time()
     val_model.fit(X_sub_resampled, y_sub_resampled)
-    print(f"  Refit {deploy_key} on the sub-training half: {time.time() - t0:.1f}s")
+    print(f"  Refit {deploy_label} on the sub-training half: {time.time() - t0:.1f}s")
     print(f"  Validation rows: {len(y_val)} (Fatal rate {y_val.mean() * 100:.1f}% — not resampled)")
 
     val_proba = val_model.predict_proba(X_val_processed)[:, 1]
@@ -1194,7 +1270,7 @@ if hasattr(deploy_estimator, "predict_proba"):
                label=f"F2 of all-positive model = {all_positive_f2:.3f}")
     ax.set_xlabel("Decision threshold on P(Fatal)")
     ax.set_ylabel("Score")
-    ax.set_title(f"Threshold selection on the validation split — {deploy_key}")
+    ax.set_title(f"Threshold selection on the validation split — {deploy_label}")
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(alpha=0.3)
     plt.tight_layout()
@@ -1334,7 +1410,8 @@ print("\n10.6 SERIALIZING WITH pickle")
 
 model_bundle = {
     "pipeline": serving_pipeline,
-    "model_name": deploy_key,
+    "model_name": deploy_label,
+    "calibration": "isotonic, 3-fold (applied at deployment, not during model comparison)",
     "threshold": DEPLOY_THRESHOLD,
     "threshold_note": threshold_note,
     "feature_order": list(X.columns),
@@ -1345,10 +1422,23 @@ model_bundle = {
     "field_schema": field_schema,
     "target_labels": {0: "Non-Fatal", 1: "Fatal"},
     "test_metrics": {
-        "at_default_threshold": {k: float(deploy_row[k]) for k in
-                                 ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]},
+        # The uncalibrated figures are the ones Deliverable 3 reported and used
+        # to pick this model; the calibrated ones describe what is actually
+        # served. Both are kept so the two can never be confused.
+        "uncalibrated_at_default_threshold": {
+            k: float(deploy_row[k]) for k in
+            ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]},
+        "at_default_threshold": {
+            "Accuracy": float(accuracy_score(y_test, (_cal_proba >= 0.5).astype(int))),
+            "Precision": float(precision_score(y_test, (_cal_proba >= 0.5).astype(int), zero_division=0)),
+            "Recall": float(recall_score(y_test, (_cal_proba >= 0.5).astype(int), zero_division=0)),
+            "F1": float(f1_score(y_test, (_cal_proba >= 0.5).astype(int), zero_division=0)),
+            "ROC-AUC": float(roc_auc_score(y_test, _cal_proba)),
+        },
         "at_deployed_threshold": deployed_test_metrics,
         "threshold_comparison": threshold_comparison,
+        "saturation_before_calibration": _saturation(_raw_proba),
+        "saturation_after_calibration": _saturation(_cal_proba),
     },
     "threshold_sweep": sweep_df.to_dict("records") if "sweep_df" in globals() else None,
     "sklearn_version": sklearn.__version__,
@@ -1466,12 +1556,94 @@ with open(META_PATH, "w") as f:
     json.dump({k: v for k, v in model_bundle.items() if k != "pipeline"}, f, indent=2, default=str)
 print(f"  Wrote {META_PATH}")
 
+# -----------------------------------------------------------------------
+# 10.9 REPORT NUMBERS FOR PART 4
+# -----------------------------------------------------------------------
+# The Part 4 write-up quotes a model comparison table and per-model confusion
+# matrices. When those are typed in by hand they drift: the report ends up
+# describing one training run while the pickled model came from another, and
+# anyone cross-checking the report against the live API finds a mismatch.
+#
+# Results are metric values, not fitted state, so they cannot be recovered
+# from model_bundle.pkl — they have to be written out by the run that produced
+# it. This file is generated from the same in-memory results that built the
+# bundle, so the two cannot disagree. Regenerate it whenever the pipeline is
+# re-run, and paste from it rather than editing the report numbers directly.
+#
+# Numbers WILL differ between machines even with random_state pinned, because
+# estimator internals change across scikit-learn versions. The environment is
+# therefore recorded alongside the table, and whichever machine the group
+# treats as canonical should be the one that generates both this file and the
+# shipped model_bundle.pkl.
+
+print("\n10.9 GENERATING THE PART 4 REPORT NUMBERS")
+
+REPORT_PATH = os.path.join(PROJECT_DIR, "part4_report_numbers.md")
+
+_report_df = results_df.copy()
+_report_df["Model"] = _report_df["Model"].str.replace(" (tuned)", "", regex=False)
+
+with open(REPORT_PATH, "w") as f:
+    f.write("# Part 4 — Model Scoring and Evaluation (generated)\n\n")
+    f.write("Generated by `public_safety_ml.py` on "
+            f"{datetime.now().isoformat(timespec='seconds')}.\n\n")
+    f.write("**Do not edit by hand.** Re-run the pipeline and paste from this file, "
+            "so the written report and the deployed `model_bundle.pkl` always "
+            "describe the same training run.\n\n")
+
+    f.write("## Environment\n\n")
+    f.write(f"- scikit-learn `{sklearn.__version__}`, pandas `{pd.__version__}`, "
+            f"numpy `{np.__version__}`\n")
+    f.write(f"- Random seed: `{RANDOM_STATE}` (pinned throughout)\n")
+    f.write("- Estimator internals change across scikit-learn releases, so a "
+            "different version reproduces the ranking but not every decimal.\n\n")
+
+    f.write("## 4.1 Performance metrics comparison\n\n")
+    f.write(f"Test set: **{len(y_test)} records** "
+            f"({int((y_test == 0).sum())} Non-Fatal vs {int((y_test == 1).sum())} Fatal). "
+            "All models trained on the SMOTE-balanced training set and evaluated at "
+            "the default 0.5 threshold.\n\n")
+    f.write("| Model | Accuracy | Precision | Recall | F1-Score | ROC-AUC |\n")
+    f.write("|---|---|---|---|---|---|\n")
+    for _, r in _report_df.iterrows():
+        f.write(f"| {r['Model']} | {r['Accuracy'] * 100:.2f}% | {r['Precision'] * 100:.2f}% "
+                f"| {r['Recall'] * 100:.2f}% | {r['F1']:.3f} | {r['ROC-AUC']:.3f} |\n")
+
+    f.write("\n## 4.3 Confusion matrices\n\n")
+    f.write("At the default 0.5 threshold, in the same order as the table above:\n\n")
+    _by_name = {r["Model"]: r for r in results}
+    for _, row in results_df.iterrows():
+        r = _by_name[row["Model"]]
+        tn, fp, fn, tp = confusion_matrix(y_test, r["y_pred"], labels=[0, 1]).ravel()
+        f.write(f"- **{row['Model'].replace(' (tuned)', '')}**: correctly identified "
+                f"{tp} fatalities, missed {fn} (false negatives), and triggered "
+                f"{fp} false positives.\n")
+
+    f.write("\n## 4.4 Deployed configuration\n\n")
+    f.write(f"- Model deployed: **{deploy_label}**\n")
+    f.write(f"- Selected as the highest test F1 on the Fatal class "
+            f"({deploy_row['F1']:.3f})\n")
+    f.write(f"- Decision threshold: **{DEPLOY_THRESHOLD:.4f}** — {threshold_note}\n")
+    f.write("- Isotonic calibration applied at the deployment stage only; the table "
+            "above reports the models exactly as tuned in Deliverable 3.\n\n")
+    if deployed_test_metrics:
+        f.write("Test metrics for the deployed configuration:\n\n")
+        f.write("| Threshold | Accuracy | Precision | Recall | F1 | F2 |\n|---|---|---|---|---|---|\n")
+        for row in threshold_comparison:
+            f.write(f"| {row['Threshold']} | {row['Accuracy'] * 100:.1f}% "
+                    f"| {row['Precision'] * 100:.1f}% | {row['Recall'] * 100:.1f}% "
+                    f"| {row['F1']:.3f} | {row['F2']:.3f} |\n")
+
+print(f"  Wrote {REPORT_PATH}")
+print("  Paste Part 4's table and confusion matrices from this file so the report")
+print("  and the shipped model can never describe different runs.")
+
 print(f"""
 DELIVERABLE 5 — EXPORT SUMMARY
 
-  Deployed model:      {deploy_key}
+  Deployed model:      {deploy_label}
   Decision threshold:  {DEPLOY_THRESHOLD:.4f} ({threshold_note})
-  Serving pipeline:    ColumnTransformer(fitted) -> {deploy_key}(fitted)
+  Serving pipeline:    ColumnTransformer(fitted) -> isotonic-calibrated {deploy_key}
   Input contract:      {len(X.columns)} raw features, pre-encoding
   Artifacts written:   model_bundle.pkl, test_samples.csv, model_metadata.json,
                        8_threshold_selection.png

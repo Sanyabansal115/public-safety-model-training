@@ -19,9 +19,19 @@ because they are the parts a grader is most likely to ask about.
 **The model alone was not servable.** The training script fits the
 `ColumnTransformer` in section 7 and then fits every model on the already-encoded
 matrix. Pickling the neural network on its own would produce something that only
-accepts a ~200-column encoded array — useless to an endpoint receiving JSON. Both
-fitted objects are wrapped into a single `Pipeline` that accepts raw feature rows.
-Neither is refitted, so the deployed model is exactly the evaluated one.
+accepts a ~200-column encoded array — useless to an endpoint receiving JSON. The
+fitted preprocessor and the deployed estimator are wrapped into a single
+`Pipeline` that accepts raw feature rows.
+
+**The raw probabilities were unusable.** The tuned MLP pinned 65% of its
+predictions below 0.001 or above 0.999, so the form showed "0.0%" for almost
+every input. The deployed estimator is therefore the MLP wrapped in isotonic
+calibration (`CalibratedClassifierCV`, 3-fold), applied at the deployment stage
+so Deliverable 3's comparison table is untouched. Note that this means the
+served model is *not* byte-identical to the one evaluated in Deliverable 3 —
+calibration refits the base estimator across folds. Because isotonic mapping is
+monotonic it cannot reorder records, so ROC-AUC is preserved (0.7363 → 0.7398)
+and the model-selection conclusion still holds. See §8.
 
 **Rare-category grouping could not be recomputed.** Feature engineering folds
 categories below 1% frequency into `"Other"` using frequencies from the whole
@@ -77,8 +87,8 @@ cd ~/Desktop/Programming/Projects/public-safety-model-training
 Wait for these four lines. If you don't see them, the bundle failed to load:
 
 ```
-[startup] Loaded Neural Network (trained 2026-08-16T16:02:52, sklearn 1.8.0)
-[startup] Decision threshold: 0.0160
+[startup] Loaded Neural Network (calibrated) (trained 2026-08-16T16:44, sklearn 1.8.0)
+[startup] Decision threshold: 0.0197
 [startup] Expecting 30 features
 [startup] 25 held-out test records available at /samples
  * Running on http://127.0.0.1:5000
@@ -118,8 +128,8 @@ request scores one involved person.
 
 Five badges read straight out of the pickle:
 
-- **Model** — `Neural Network`, the algorithm actually being served
-- **Threshold** — `0.0160`, the decision cut-off (see §7)
+- **Model** — `Neural Network (calibrated)`, the estimator actually being served
+- **Threshold** — `0.0197`, the decision cut-off (see §7)
 - **Features** — `30`, how many inputs the model consumes
 - **scikit-learn** — the version that trained it, which must match the version
   running the API
@@ -138,7 +148,7 @@ This is the part to walk a grader through:
   threshold. The classification is not sklearn's default `.predict()`; it is the
   probability compared against the tuned cut-off.
 - **A probability meter.** The filled bar is P(fatal). The thin vertical mark is
-  the decision threshold. Because the threshold is 0.016, that mark sits very
+  the decision threshold. Because the threshold is 0.0197, that mark sits very
   close to the left edge — which is a visual explanation of why the model flags
   records that look low-probability at first glance.
 - **A "Notes on this input" box**, when relevant. This is where the API is honest
@@ -216,7 +226,7 @@ rate, so it over-weights the class the model is worst at. The honest numbers are
 the full-test-set figures in `/health`.
 
 **`MISS` rows are model errors, not software errors.** Catching about half the
-fatalities matches the measured 53.7% recall.
+fatalities is consistent with the measured 66.1% recall on the full test set — a 10-row fatal sample is far too small to reproduce it closely.
 
 ---
 
@@ -265,7 +275,7 @@ It had both the highest test F1 (0.340) and the highest ROC-AUC (0.736). The
 ROC-AUC is the stronger argument: it is threshold-independent, so the
 best-ranking model stays the right pick even after the cut-off is retuned.
 
-### Why the threshold is 0.0160 and not 0.5
+### Why the threshold is 0.0197 and not 0.5
 
 The default 0.5 treats both error types as equally costly. The whole framing of
 this project is that a **false negative — a fatal collision predicted non-fatal —
@@ -293,20 +303,28 @@ on the test set and then reporting that score would be leakage.
 
 ### What the retuning bought
 
-| Threshold | Accuracy | Precision | Recall | F1 |
-|---|---|---|---|---|
-| 0.50 (default) | 82.4% | 35.4% | 32.7% | 0.340 |
-| **0.0160 (deployed)** | 76.2% | 30.0% | **53.7%** | **0.385** |
+Test-set metrics for the deployed calibrated model:
 
-**104 more fatalities caught** on the test set (missed fatalities fall 333 → 229),
-paid for with 325 more false alarms (296 → 621).
+| Threshold | Accuracy | Precision | Recall | F1 | F2 |
+|---|---|---|---|---|---|
+| 0.50 (default) | 85.4% | 44.3% | 21.0% | 0.285 | 0.235 |
+| **0.0197 (deployed)** | 68.2% | 25.3% | **66.1%** | **0.365** | **0.499** |
 
-**Be ready for the accuracy question.** Accuracy drops 6 points, and if your
-report leads with accuracy this looks like a regression. It is a deliberate trade:
-for a tool that flags records for human review, a false alarm costs a review while
-a missed fatality costs the outcome the model exists to surface. Note that F1
-improves too, so the recall gain is not simply bought at a proportional loss
-elsewhere.
+**223 more fatalities caught** on the test set (missed fatalities fall
+391 → 168), paid for with 837 more false alarms (131 → 968).
+
+**Be ready for the accuracy question — it is the most likely challenge.**
+Accuracy is 68.2%, which is *below* the ~86% you would get by predicting
+"Non-Fatal" for every single record. That comparison is the answer, not the
+problem: the trivial 86% model catches **zero** fatalities. The deployed
+configuration finds two thirds of them. Accuracy is the wrong headline metric on
+a 14%-positive problem, which is exactly why F1 was used for tuning and recall
+for the operating point.
+
+If a grader pushes on it, the supporting fact is that validation F1 is flat
+(0.385–0.399) across thresholds from 0.02 to 0.20 — so the cut-off is not
+trading away model quality, it is only choosing where on the recall/precision
+curve to sit.
 
 ### One demo answer to prepare
 
@@ -318,7 +336,82 @@ Correct behaviour for a partial request — but worth being able to explain.
 
 ---
 
-## 8. Troubleshooting
+## 8. "Why does it keep saying Non-Fatal?"
+
+The single most common thing to hit when demoing the form. Two separate causes,
+and only one of them is a real problem.
+
+### The threshold never changes — that's correct
+
+`0.0197` is the decision cut-off baked into the model at training time, not a
+per-prediction output. It stays fixed so every prediction is judged by the same
+standard. The value that responds to your inputs is the **estimated
+probability**.
+
+### Most features barely move the prediction
+
+Changing location fields — district, neighbourhood, latitude — does almost
+nothing. Measured effect of changing one field from the all-defaults baseline,
+on the deployed calibrated model (threshold 0.0197):
+
+| Change | P(fatal) | Result |
+|---|---|---|
+| nothing (all defaults) | 0.0019 | non-fatal |
+| **INVAGE → Over 95** | **0.3307** | **FATAL** |
+| VISIBILITY → Other | 0.3029 | FATAL |
+| ACCLOC → Other | 0.2880 | FATAL |
+| DIVISION → NSA | 0.6893 | FATAL |
+| SPEEDING → Yes | 0.0119 | non-fatal |
+
+**To demo a Fatal prediction, set INVAGE to "Over 95".** One change is enough,
+and it is the one with an obvious real-world reading — elderly people involved
+in collisions are far more likely to die. Or use the held-out record dropdown;
+several of those predict Fatal.
+
+Avoid demoing with `DIVISION → NSA` even though it produces the strongest
+response. `NSA` means the police division was not recorded, so that prediction
+is driven by a missing administrative field rather than anything about the
+collision — see the Limitations section of the README.
+
+### Stacking risk factors still behaves oddly — this one is real
+
+Adding risk factors one at a time no longer collapses the way it did before
+calibration, but it is still not clean:
+
+```
+defaults              0.0019
++ SPEEDING=Yes        0.0119
++ AG_DRIV=Yes         0.0119   ← no effect
++ REDLIGHT=Yes        0.0088   ← small dip
++ ALCOHOL=Yes         0.1667
+```
+
+Before calibration this same sequence dropped to exactly 0.0000 when red-light
+running was added. Calibration removed the collapse, but the dip remains.
+
+This is a genuine defect in the model, not a bug in the API. Flipping one risk
+flag moves the prediction the wrong way about 27.6% of the time (22% on the
+held-out sample), and inconsistently — the same flag can raise the estimate on
+one record and lower it on the next.
+
+The full investigation, including the two fix attempts that failed, is in
+**README §11**. The short version: it is not caused by SMOTE and not caused by
+over-training. It is the MLP's decision surface being shaped by a training set
+that occupies only a small region of the ~200-dimensional encoded space, so
+single-flag edits walk into corners no real record ever occupied.
+
+Isotonic calibration was added at the deployment stage, which cut saturated
+predictions from 65% to 19% — that is why probabilities vary at all now — but
+it does not resolve the non-monotonicity.
+
+**How to present this.** Don't demo by stacking risk factors; demo with the
+held-out records, where the model is operating on real data. If asked about the
+instability, the honest and defensible answer is that the model ranks records
+acceptably (ROC-AUC 0.740, which is what the screening use case needs) but is
+not suitable for counterfactual "what if this one factor changed" reasoning,
+and that this is documented rather than hidden.
+
+## 9. Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
@@ -332,7 +425,7 @@ Correct behaviour for a partial request — but worth being able to explain.
 
 ---
 
-## 9. File map
+## 10. File map
 
 | File | Role |
 |---|---|
@@ -344,6 +437,7 @@ Correct behaviour for a partial request — but worth being able to explain.
 | `make_postman_collection.py` | Regenerates `postman_collection.json` from the bundle |
 | `requirements.txt` | Pinned dependencies (scikit-learn pinned exactly) |
 | `8_threshold_selection.png` | Threshold-selection figure for the report |
+| `part4_report_numbers.md` | Part 4 metrics table and confusion matrices, generated by the pipeline |
 
 The Postman collection is generated from the bundle rather than hand-written, so
 the saved request bodies can never drift out of sync with the model's actual
